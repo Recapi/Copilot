@@ -100,6 +100,48 @@ Onde as coisas ficam: o estado **pessoal** (cota, consumo) vai para
 (repos, verificações, modelos por papel) fica em `./copiloto.json`, criada pelo
 `init` e versionável no git do projeto.
 
+### Como casca do copilot do trabalho
+
+O `copiloto.py` é a porta de entrada; o `copilot` de verdade roda por baixo:
+
+```bash
+python3 copiloto.py pedir "o que faz a funcao X?"   # prompt avulso: passa pelo
+                                                    # portão, usa o modelo barato
+                                                    # (--forte / --modelo mudam)
+python3 copiloto.py sessao                          # mostra o saldo do dia e abre
+                                                    # o copilot interativo; ao sair,
+                                                    # lembra de sincronizar o gasto
+python3 copiloto.py atualizar                       # baixa a versão mais nova DESTE
+                                                    # arquivo do GitHub e se substitui
+                                                    # (backup .bak; valida antes)
+```
+
+O `atualizar` baixa de `Recapi/Copilot` (branch `main`) por HTTPS direto — 
+respeita `HTTPS_PROXY` — com fallback para o `gh`. Fluxo: melhora em casa,
+`git push`, e no trabalho só `python3 copiloto.py atualizar`.
+
+### As libs de economia (instala, atualiza e usa)
+
+```bash
+python3 copiloto.py libs status              # o que está instalado nesta máquina
+python3 copiloto.py libs instalar --todas    # ripgrep, rtk, ast-grep, repomix
+python3 copiloto.py libs instalar rtk        # (rodar de novo = atualizar)
+```
+
+Sem admin, e **sem tocar na máquina**: os binários vêm da release oficial no
+GitHub de cada projeto (asset escolhido pela sua plataforma) e ficam em
+`~/.copiloto/libs/bin` — uma pasta que entra no PATH **apenas dos processos
+que a casca abre** (o copilot, as verificações, a sessão interativa). O PATH
+do seu usuário não muda; fora do `copiloto.py`, é como se as libs não
+existissem. Quem preferir no PATH de verdade usa `--global`. ast-grep e
+repomix também instalam via npm quando houver.
+
+E o **usar** é automático: os prompts do planejador e do executor ganham um
+bloco listando as ferramentas presentes na máquina com a instrução de uso —
+`rtk` prefixando comandos de terminal, `rg` antes de abrir arquivo, `ast-grep`
+para refactor estrutural. Se a lib não está instalada, o bloco não aparece e
+nada quebra.
+
 ### Trabalho com dois repositórios (fonte + config)
 
 Rode o `init` numa pasta que enxergue os dois e liste ambos:

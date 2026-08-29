@@ -63,7 +63,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-VERSAO = "2026.08.29.4"
+VERSAO = "2026.08.29.5"
 REPO_ATUALIZACAO = os.environ.get("COPILOTO_REPO", "Recapi/Copilot")
 
 # --------------------------------------------------------------------------- #
@@ -1260,6 +1260,7 @@ def chamar(cfg: dict, papel: str, prompt: str, forcar: bool, nota: str) -> str:
     inicio = time.time()
     try:
         r = subprocess.run(cmd, input=entrada, capture_output=True, text=True,
+                           env=_env_com_libs(),
                            timeout=int(cfg.get("timeout_seg", 900)))
     except FileNotFoundError:
         print(f"erro: comando '{cmd[0]}' nao encontrado. Ajuste 'cmd' em copiloto.json.",
@@ -1298,7 +1299,8 @@ def verificar(comandos: list[str]) -> tuple[bool, str]:
     for c in comandos:
         print(f"   verificando (gratis): {c}")
         try:
-            r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=600)
+            r = subprocess.run(c, shell=True, capture_output=True, text=True,
+                               env=_env_com_libs(), timeout=600)
         except subprocess.TimeoutExpired:
             ok_geral = False
             partes.append(f"$ {c}\n[timeout]")
@@ -1678,6 +1680,23 @@ def _dir_bin() -> Path:
     return Path.home() / ("bin" if os.name == "nt" else ".local/bin")
 
 
+DIR_LIBS = DIR_PESSOAL / "libs" / "bin"
+
+
+def _env_com_libs() -> dict:
+    """Ambiente dos subprocessos da casca: as libs baixadas entram no PATH
+    APENAS aqui — o PATH da maquina/usuario nao e tocado."""
+    env = dict(os.environ)
+    if DIR_LIBS.is_dir():
+        env["PATH"] = str(DIR_LIBS) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def _which(cmd: str) -> str | None:
+    """Como shutil.which, mas enxergando tambem as libs da sessao."""
+    return shutil.which(cmd, path=_env_com_libs().get("PATH"))
+
+
 def _baixar_url(url: str) -> bytes:
     import urllib.request
     pedido = urllib.request.Request(url, headers={"User-Agent": "copiloto.py"})
@@ -1731,12 +1750,16 @@ def _escolher_asset(assets: list[dict]) -> dict | None:
     return melhor
 
 
-def _instalar_binario(nome_lib: str, info: dict) -> bool:
-    """Baixa a release, extrai o binario e coloca na pasta de bin do usuario."""
+def _instalar_binario(nome_lib: str, info: dict, global_: bool = False) -> bool:
+    """Baixa a release e extrai o binario.
+
+    Padrao: ~/.copiloto/libs/bin — fica disponivel SO dentro da casca (o PATH
+    do usuario nao muda). Com global_, vai para a pasta de bin do usuario.
+    """
     import io
     import tarfile
     import zipfile
-    destino_dir = _dir_bin()
+    destino_dir = _dir_bin() if global_ else DIR_LIBS
     destino_dir.mkdir(parents=True, exist_ok=True)
     try:
         assets = _release_assets(info["repo"])
@@ -1788,7 +1811,7 @@ def _instalar_binario(nome_lib: str, info: dict) -> bool:
         if caminho.exists() and os.name != "nt":
             caminho.chmod(0o755)
     print(f"  {nome_lib}: instalado em {destino_dir}")
-    if shutil.which(info["checar"]) is None:
+    if global_ and shutil.which(info["checar"]) is None:
         if os.name == "nt":
             print(f"  atencao: {destino_dir} nao esta no PATH. Rode: "
                   f'setx PATH "%PATH%;{destino_dir}"  (e abra novo terminal)')
@@ -1811,15 +1834,22 @@ def _instalar_npm(nome_lib: str, pacote: str) -> bool:
 
 
 def cmd_libs_status(args) -> int:
-    print(f"\n  pasta de binarios do usuario: {_dir_bin()}"
-          f"{'' if str(_dir_bin()) in os.environ.get('PATH', '') else '  (FORA do PATH!)'}\n")
+    print(f"\n  libs da casca (so na sessao): {DIR_LIBS}")
+    print(f"  bin global do usuario:        {_dir_bin()}"
+          f"{'' if str(_dir_bin()) in os.environ.get('PATH', '') else '  (fora do PATH)'}\n")
     for nome, info in LIBS.items():
-        onde = shutil.which(info["checar"])
-        estado = f"{VERDE}ok{FIM}  {onde}" if onde else f"{VERMELHO}falta{FIM}"
+        onde = _which(info["checar"])
+        if onde and str(DIR_LIBS) in onde:
+            estado = f"{VERDE}ok (sessao){FIM}  {onde}"
+        elif onde:
+            estado = f"{VERDE}ok (global){FIM}  {onde}"
+        else:
+            estado = f"{VERMELHO}falta{FIM}"
         print(f"  {nome:<10} {estado}")
         print(f"  {'':<10} {CINZA}{info['para_que']}{FIM}")
     print(f"\n  instalar/atualizar: python3 copiloto.py libs instalar [nome ...|--todas]")
-    print("  (sem admin: binarios vao para a pasta acima; ast-grep/repomix via npm se houver)\n")
+    print("  Padrao: as libs ficam SO na sessao da casca (PATH da maquina intocado);")
+    print("  --global instala na pasta de bin do usuario.\n")
     return 0
 
 
@@ -1835,7 +1865,7 @@ def cmd_libs_instalar(args) -> int:
         info = LIBS[nome]
         ok = False
         if "repo" in info:
-            ok = _instalar_binario(nome, info)
+            ok = _instalar_binario(nome, info, global_=args.global_)
         if not ok and info.get("npm"):
             ok = _instalar_npm(nome, info["npm"])
         if not ok:
@@ -1847,15 +1877,15 @@ def cmd_libs_instalar(args) -> int:
 
 def contexto_libs() -> str:
     """Bloco injetado nos prompts: diz ao modelo quais ferramentas de economia
-    existem NESTA maquina e como usa-las. E assim que as libs sao 'usadas'."""
+    existem NESTA sessao e como usa-las. E assim que as libs sao 'usadas'."""
     linhas = []
-    if shutil.which("rtk"):
+    if _which("rtk"):
         linhas.append("- `rtk`: prefixe comandos de terminal com rtk (ex.: `rtk git log`, "
                       "`rtk npm test`) para receber a saida comprimida — gasta bem menos tokens.")
-    if shutil.which("rg"):
+    if _which("rg"):
         linhas.append("- `rg` (ripgrep): busque com rg antes de abrir qualquer arquivo; "
                       "leia so os trechos que ele apontar.")
-    if shutil.which("ast-grep"):
+    if _which("ast-grep"):
         linhas.append("- `ast-grep`: para achar/alterar padroes estruturais de codigo "
                       "(ex.: `ast-grep run -p 'foo($X)' -l py`), em vez de ler arquivos inteiros.")
     if not linhas:
@@ -1914,7 +1944,9 @@ def cmd_sessao(args) -> int:
     cmd += extras
     print(f"{CINZA}$ {shlex.join(cmd)}{FIM}\n")
     try:
-        codigo = subprocess.call(cmd)  # herda stdin/stdout: sessao interativa
+        # Herda stdin/stdout (sessao interativa); as libs da casca entram no PATH
+        # deste processo filho — o agente enxerga rtk/rg/ast-grep normalmente.
+        codigo = subprocess.call(cmd, env=_env_com_libs())
     except FileNotFoundError:
         print(f"erro: '{binario}' nao encontrado no PATH. Instale o Copilot CLI "
               "ou ajuste o cmd em copiloto.json.", file=sys.stderr)
@@ -2070,6 +2102,8 @@ def main(argv: list[str] | None = None) -> int:
     sp = lsub.add_parser("instalar", help="instala/atualiza (release do GitHub ou npm), sem admin")
     sp.add_argument("nomes", nargs="*", help=f"quais ({', '.join(LIBS)}); vazio + --todas = todas")
     sp.add_argument("--todas", action="store_true")
+    sp.add_argument("--global", dest="global_", action="store_true",
+                    help="instala no bin do usuario (PATH) em vez de so na sessao da casca")
     sp.set_defaults(func=cmd_libs_instalar)
 
     # ---- mapa ----
