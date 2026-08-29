@@ -13,7 +13,7 @@ de tokens que circula em artigos de 2026:
 
 | Você disse | Nome real | O que faz |
 |---|---|---|
-| "harmens" | **harness** | O "arnês": o script que amarra os modelos num fluxo. É o `harness.py` desta pasta. |
+| "harmens" | **harness** | O "arnês": o script que amarra os modelos num fluxo. É o `planejar`/`rodar` do `copiloto.py`. |
 | "RTK" | **rtk** (rtk-ai/rtk) | Comprime a saída de comandos (git, npm, ls...) antes de chegar ao modelo. Corta 60–90% desses tokens. |
 | "headroom" | **Headroom** (headroomlabs-ai/headroom) | Comprime contexto (logs, JSON, arquivos) antes de mandar pro modelo. |
 | "mancave" | **Caveman** (sílabas invertidas: cave-man) | Faz o modelo responder telegráfico — corta tokens de saída (números auto-reportados). |
@@ -39,13 +39,13 @@ requests × multiplicador. Confira qual é o seu caso antes de otimizar:
 - No site: `github.com/settings/billing` → aba "AI usage", ou a página de
   settings do Copilot → "Usage this cycle" (mostra tipo "450 / 1.900 AI
   credits used").
-- Por script (consumo do mês, para alimentar o `orcamento.py`):
+- Por script (é o que o `copiloto.py orcamento sincronizar` faz sozinho):
   ```bash
   gh api "/users/SEU_LOGIN/settings/billing/ai_credit/usage?year=2026&month=8" \
      -H "X-GitHub-Api-Version: 2026-03-10"
   ```
   Não existe endpoint oficial de **saldo restante** — só de consumo; o
-  restante é `cota − consumo` (que é exatamente o que o `orcamento.py` faz).
+  restante é `cota − consumo` (que é exatamente o que o `copiloto.py` faz).
 
 Se for Business/Enterprise: a cota padrão é 1.900 créditos/usuário (promo de
 3.000 **acaba em 01/09/2026** — semana que vem! — a cota efetiva pode cair).
@@ -82,29 +82,50 @@ As três regras de economia embutidas:
 3. **Portão de orçamento antes de toda chamada paga.** Se não cabe na cota do
    dia, o script para e explica — em vez de queimar o mês numa tarde.
 
-## 4. As ferramentas desta pasta
+## 4. A ferramenta: um arquivo só
 
-| Arquivo | O que faz | Custo |
+Tudo mora em **`copiloto.py`** — um único arquivo, Python 3.10+ puro (stdlib,
+sem pip, sem admin). Para levar pro trabalho: copie **um arquivo**. Os prompts
+dos 3 papéis e os templates estão embutidos nele.
+
+| Comando | O que faz | Custo |
 |---|---|---|
-| `calendario.py` | Dias úteis + feriados nacionais BR (validado contra a Portaria MGI: 2026 tem 21 dias úteis em agosto, Carnaval 16–17/02 etc.) | zero |
-| `orcamento.py` | A cota do mês rateada pelos **dias úteis restantes**, recalculada a cada dia, com reserva de 15% que vai sendo liberada até o fim do ciclo | zero |
-| `mapa.py` | Gera `MAPA.md` do repositório (estrutura, símbolos, dependências) por regex local — o modelo começa sabendo onde as coisas estão em vez de explorar pagando token | zero |
-| `harness.py` | O orquestrador dos 3 papéis, com portão de orçamento e leitura do consumo real via `--usage-output-file` do Copilot CLI | só as chamadas de modelo |
-| `prompts/` | Os 3 prompts de papel (planejar / executar / validar) | — |
-| `modelos/` | Templates: `.agent.md` (custom agents nativos do Copilot CLI), `AGENTS.md` com padrão de memória, exemplo de MCP de memória | — |
+| `copiloto.py orcamento ...` | A cota do mês rateada pelos **dias úteis restantes** (feriados BR validados contra a Portaria MGI), recalculada a cada dia, com reserva de 15% liberada até o fim do ciclo | zero |
+| `copiloto.py mapa ...` | Gera `MAPA.md` de um ou **vários** repositórios (símbolos via `ast` em Python, regex nas outras linguagens) — o modelo começa sabendo onde as coisas estão | zero |
+| `copiloto.py planejar / rodar` | O harness dos 3 papéis, com portão de orçamento, sessões reutilizadas e consumo real via `--usage-output-file` | só as chamadas de modelo |
+| `copiloto.py instalar <repo>` | Grava os custom agents (`.github/agents/*.agent.md`) e o `AGENTS.md` com padrão de memória num repo; `--mcp` mostra o exemplo do grafo de memória | zero |
+
+Onde as coisas ficam: o estado **pessoal** (cota, consumo) vai para
+`~/.copiloto/` — a cota é sua, não do projeto; a configuração **do projeto**
+(repos, verificações, modelos por papel) fica em `./copiloto.json`, criada pelo
+`init` e versionável no git do projeto.
+
+### Trabalho com dois repositórios (fonte + config)
+
+Rode o `init` numa pasta que enxergue os dois e liste ambos:
+
+```bash
+cd ~/projetos/meu-sistema        # pasta que contém fonte/ e config/
+python3 copiloto.py init --repo ./fonte --repo ./config
+python3 copiloto.py mapa ./fonte ./config -o MAPA.md
+```
+
+Com isso: o `MAPA.md` tem uma seção por repo; o **diff que o validador lê
+cobre os dois** (rotulado por repo); as verificações detectadas rodam com
+`cd <repo> &&`; e cada repo é repassado ao copilot via `--add-dir`, para o
+executor poder mexer nos dois.
 
 ### O orçamento em 30 segundos
 
 ```bash
-python3 orcamento.py init --cota 10000 --unidade "creditos de IA"
-python3 orcamento.py status      # quanto posso gastar HOJE
-python3 orcamento.py gasto 120 --modelo claude-sonnet --nota "refactor X"
-python3 orcamento.py pode 300 && copilot -p "..."   # portão p/ scripts (exit 0/1)
-python3 orcamento.py plano       # distribuição dia a dia até o fim do mês
-python3 orcamento.py resumo      # gasto por dia e por modelo
-python3 orcamento.py sincronizar # puxa o consumo REAL do mês via `gh api` e
-                                 # ajusta o registro local (pega o que você
-                                 # gastou fora do harness: VS Code, site...)
+python3 copiloto.py orcamento init --cota 10000 --unidade "creditos de IA"
+python3 copiloto.py orcamento status   # quanto posso gastar HOJE
+python3 copiloto.py orcamento gasto 120 --modelo claude-sonnet --nota "refactor X"
+python3 copiloto.py orcamento pode 300 && copilot -p "..."  # portão (exit 0/1)
+python3 copiloto.py orcamento plano    # distribuição dia a dia até o fim do mês
+python3 copiloto.py orcamento resumo   # gasto por dia e por modelo
+python3 copiloto.py orcamento sincronizar  # puxa o consumo REAL do mês via
+                                           # `gh api` (pega o gasto de fora)
 ```
 
 O `sincronizar` precisa do `gh` autenticado (`gh auth login`; se reclamar de
@@ -119,12 +140,12 @@ acumulada". Sábado, domingo e feriado não têm cota própria.
 ### O harness em 30 segundos
 
 ```bash
-python3 mapa.py /caminho/do/repo -o MAPA.md   # 1x por repo, grátis
-python3 harness.py init                        # detecta testes/linter do projeto
-python3 harness.py planejar "adicionar retry com backoff no cliente HTTP"
+python3 copiloto.py mapa -o MAPA.md      # 1x por repo, grátis
+python3 copiloto.py init                 # cria copiloto.json e detecta testes/linter
+python3 copiloto.py planejar "adicionar retry com backoff no cliente HTTP"
 # revise plano.md no editor (corrigir plano é grátis; corrigir código é caro)
-python3 harness.py rodar                       # executa e valida passo a passo
-python3 harness.py custo                       # como ficou o orçamento
+python3 copiloto.py rodar                # executa e valida passo a passo
+python3 copiloto.py custo                # como ficou o orçamento
 ```
 
 Três comportamentos que economizam de verdade:
@@ -132,7 +153,7 @@ Três comportamentos que economizam de verdade:
 - **Prompt via stdin** — o prompt (que embute o MAPA.md) vai por stdin, não por
   argumento; no Windows a linha de comando estoura em ~32 KB e via stdin não há
   limite. Se a sua versão do CLI não aceitar prompt por stdin, acrescente
-  `"-p", "{prompt}"` ao `cmd` do papel em `harness.json`.
+  `"-p", "{prompt}"` ao `cmd` do papel em `copiloto.json`.
 - **Sessão reutilizada** — cada papel continua a própria sessão do copilot
   (`--resume`) dentro de uma execução: o contexto não é reenviado inteiro a
   cada chamada (input em cache custa ~10%), e correções viram follow-ups curtos.
@@ -140,7 +161,7 @@ Três comportamentos que economizam de verdade:
   de novo pula (e não paga) os passos já aprovados. `--refazer` ignora isso;
   mudou o `plano.md`, o progresso é descartado sozinho.
 
-Configure os modelos em `harness.json` (papel → comando + custo estimado).
+Configure os modelos em `copiloto.json` (papel → comando + custo estimado).
 Modelos que a pesquisa encontrou no CLI hoje: fortes = `claude-sonnet-4.6`,
 `gpt-5.3-codex`, `gemini-3.1-pro`; baratos = `gpt-5-mini`, `claude-haiku-4.5`.
 Confirme os nomes exatos com `/model` dentro do `copilot` — muda toda hora.
@@ -228,7 +249,7 @@ TODO prompt); o resto recuperado sob demanda.
 4. **"Rode lint e testes e corrija até passar" no MESMO prompt** — validador
    grátis dentro da rodada, em vez de gastar outro prompt pra perguntar
    "ficou certo?".
-5. **`MAPA.md` (mapa.py) + `rg` antes de perguntar** — cole só o trecho/diff
+5. **`MAPA.md` (`copiloto.py mapa`) + `rg` antes de perguntar** — cole só o trecho/diff
    relevante; não deixe o agente "procurar" pagando token.
 6. **Peça diff/patch, não arquivo inteiro** (output custa ~5× o input).
 7. **`/context` e `/compact`** quando a sessão inchar; desabilite MCP servers
