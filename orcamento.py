@@ -429,6 +429,10 @@ def consumo_api(login: str, ano: int, mes: int) -> tuple[float, int]:
     usageItems com grossQuantity (total), discountQuantity (coberto pela cota
     do plano) e netQuantity (excedente cobrado). Parsing defensivo: o formato
     e recente e pode ganhar campos.
+
+    Limitacao conhecida: a chamada nao pagina. Os itens sao agregados por
+    modelo/sku no mes, entao a lista e curta na pratica; se um dia o total
+    parecer menor que o do site, suspeite de paginacao.
     """
     saida = _gh([
         "api", f"/users/{login}/settings/billing/ai_credit/usage?year={ano}&month={mes}",
@@ -497,6 +501,10 @@ def cmd_sincronizar(args) -> int:
     if abs(diferenca) < 0.005:
         print("ja esta em dia — nada a ajustar")
     else:
+        if diferenca < 0:
+            print("aviso: a API reporta MENOS que o registro local — pode ser atraso de "
+                  "ingestao do lado do GitHub (gasto de hoje ainda nao contabilizado). "
+                  "O proximo sincronizar reequilibra.", file=sys.stderr)
         registrar(diferenca, "(sincronizacao)", f"ajuste para bater com a API ({total_api:g} no mes)", hoje)
         verbo = "acrescentado" if diferenca > 0 else "abatido"
         print(f"{verbo} {abs(diferenca):g} para bater com a API")

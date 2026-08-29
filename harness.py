@@ -207,13 +207,13 @@ def _capturar_sessao(papel: str, inicio: float) -> None:
         return
     ja_reivindicadas = set(SESSOES.values())
     try:
-        candidatos = [d for d in _dir_sessoes().iterdir()
-                      if d.is_dir() and d.name not in ja_reivindicadas
-                      and d.stat().st_mtime >= inicio - 2]
+        candidatos = [(d.stat().st_mtime, d.name) for d in _dir_sessoes().iterdir()
+                      if d.is_dir() and d.name not in ja_reivindicadas]
+        candidatos = [c for c in candidatos if c[0] >= inicio - 2]
     except OSError:
         return
     if candidatos:
-        SESSOES[papel] = max(candidatos, key=lambda d: d.stat().st_mtime).name
+        SESSOES[papel] = max(candidatos)[1]
 
 
 def tem_sessao(papel: str) -> bool:
@@ -471,12 +471,13 @@ def carregar_progresso(sha: str) -> dict[int, str]:
         return {}
     try:
         dados = json.loads(PROGRESSO.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        if dados.get("plano_sha") != sha:
+            print("plano.md mudou desde a ultima execucao — progresso anterior descartado")
+            return {}
+        return {int(k): str(v) for k, v in (dados.get("resultados") or {}).items()}
+    except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        print("progresso.json ilegivel — recomecando do zero", file=sys.stderr)
         return {}
-    if dados.get("plano_sha") != sha:
-        print("plano.md mudou desde a ultima execucao — progresso anterior descartado")
-        return {}
-    return {int(k): v for k, v in dados.get("resultados", {}).items()}
 
 
 def salvar_progresso(sha: str, resultados: dict[int, str]) -> None:

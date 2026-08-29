@@ -111,7 +111,7 @@ def extrair_python(texto: str, max_simbolos: int) -> tuple[list[str], list[str]]
     """
     try:
         arvore = ast.parse(texto)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
         return None
 
     simbolos: list[str] = []
