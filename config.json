@@ -1,0 +1,10 @@
+{
+  "cota_ciclo": 300.0,
+  "unidade": "requisicoes premium",
+  "dia_reset": 1,
+  "reserva_pct": 0.15,
+  "incluir_facultativos": true,
+  "feriados_extras": [],
+  "feriados_removidos": [],
+  "multiplicadores": {}
+}

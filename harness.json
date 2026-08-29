@@ -1,0 +1,41 @@
+{
+  "_comentario": "Ajuste 'cmd' de cada papel para o CLI que voce usa. {prompt} e substituido pelo texto do prompt. 'custo' e quanto cada chamada consome da sua cota (no Copilot, requisicao premium x multiplicador do modelo).",
+  "papeis": {
+    "planejador": {
+      "cmd": [
+        "copilot",
+        "-p",
+        "{prompt}",
+        "--model",
+        "MODELO_FORTE",
+        "--allow-all-tools"
+      ],
+      "custo": 1.0
+    },
+    "executor": {
+      "cmd": [
+        "copilot",
+        "-p",
+        "{prompt}",
+        "--model",
+        "MODELO_BARATO",
+        "--allow-all-tools"
+      ],
+      "custo": 0.0
+    },
+    "validador": {
+      "cmd": [
+        "copilot",
+        "-p",
+        "{prompt}",
+        "--model",
+        "MODELO_FORTE"
+      ],
+      "custo": 1.0
+    }
+  },
+  "verificacoes": [],
+  "max_tentativas_executor": 2,
+  "max_rodadas_ajuste": 2,
+  "timeout_seg": 900
+}
