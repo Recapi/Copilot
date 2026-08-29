@@ -54,6 +54,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,7 +63,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-VERSAO = "2026.08.29.3"
+VERSAO = "2026.08.29.4"
 REPO_ATUALIZACAO = os.environ.get("COPILOTO_REPO", "Recapi/Copilot")
 
 # --------------------------------------------------------------------------- #
@@ -1411,6 +1412,7 @@ def cmd_planejar(args) -> int:
     prompt = (
         ler_prompt("01-planejar.md")
         + contexto_mapa()
+        + contexto_libs()
         + f"\n\n--- TAREFA ---\n{args.tarefa}\n\n"
         "Escreva o plano no arquivo plano.md, no formato exigido acima."
     )
@@ -1433,7 +1435,8 @@ def executar_passo(cfg: dict, passo: dict, forcar: bool) -> str:
     verificacoes = ([passo["verificacao"]] if passo["verificacao"] else []) + cfg["verificacoes"]
     print(f"\n{'=' * 70}\nPASSO {passo['n']}: {passo['titulo']}\n{'=' * 70}")
 
-    instrucao = ler_prompt("02-executar.md") + contexto_mapa() + "\n\n--- PASSO A EXECUTAR ---\n" + passo["texto"]
+    instrucao = (ler_prompt("02-executar.md") + contexto_mapa() + contexto_libs()
+                 + "\n\n--- PASSO A EXECUTAR ---\n" + passo["texto"])
     saida_exec = chamar(cfg, "executor", instrucao, forcar, f"passo {passo['n']}")
     if "BLOQUEADO" in saida_exec:
         print("   executor reportou BLOQUEADO — parando este passo")
@@ -1557,6 +1560,8 @@ TPL_AGENTS_MD = """\
 - Valide com linter e testes locais ANTES de dar a tarefa por encerrada.
 - Prefira responder com diff/patch, nao com arquivo inteiro reescrito.
 - Va direto ao ponto nas respostas; sem preambulo nem recapitulacao.
+- Se o comando `rtk` existir nesta maquina, prefixe comandos de terminal com
+  ele (ex.: `rtk git log`) para receber a saida comprimida.
 
 ## Memoria do projeto
 Fatos duraveis ficam em `.memory/` (um markdown por topico):
@@ -1642,6 +1647,221 @@ def cmd_instalar(args) -> int:
         print("\nExemplo de MCP de memoria (copie para ~/.copilot/mcp-config.json):\n")
         print(TPL_MCP)
     return 0
+
+
+# =========================================================================== #
+# LIBS — instala/atualiza os acessorios de economia e ensina o agente a usa-los
+# =========================================================================== #
+
+LIBS = {
+    "ripgrep": {
+        "repo": "BurntSushi/ripgrep", "binarios": ["rg"], "checar": "rg",
+        "para_que": "busca rapida no codigo (os prompts ja mandam usar rg)",
+    },
+    "rtk": {
+        "repo": "rtk-ai/rtk", "binarios": ["rtk"], "checar": "rtk",
+        "para_que": "comprime a saida de comandos (git, npm...) em 60-90%",
+    },
+    "ast-grep": {
+        "repo": "ast-grep/ast-grep", "binarios": ["ast-grep", "sg"], "checar": "ast-grep",
+        "npm": "@ast-grep/cli",
+        "para_que": "busca/refactor estrutural por AST, sem gastar modelo",
+    },
+    "repomix": {
+        "npm": "repomix", "checar": "repomix",
+        "para_que": "empacota o repo comprimido (~70% menos tokens); da para usar sem instalar: npx repomix@latest",
+    },
+}
+
+
+def _dir_bin() -> Path:
+    return Path.home() / ("bin" if os.name == "nt" else ".local/bin")
+
+
+def _baixar_url(url: str) -> bytes:
+    import urllib.request
+    pedido = urllib.request.Request(url, headers={"User-Agent": "copiloto.py"})
+    with urllib.request.urlopen(pedido, timeout=120) as resposta:
+        return resposta.read()
+
+
+def _release_assets(repo: str) -> list[dict]:
+    """Assets da release mais recente, via gh (proxy/auth ja configurados) ou API."""
+    try:
+        texto = _gh(["api", f"repos/{repo}/releases/latest"])
+    except RuntimeError:
+        texto = _baixar_url(f"https://api.github.com/repos/{repo}/releases/latest").decode("utf-8")
+    dados = json.loads(texto)
+    return [{"nome": a.get("name", ""), "url": a.get("browser_download_url", "")}
+            for a in dados.get("assets", [])]
+
+
+def _escolher_asset(assets: list[dict]) -> dict | None:
+    """Pontua os assets pelo sistema/arquitetura desta maquina."""
+    import platform as plt
+    arq = plt.machine().lower()
+    eh_arm = arq in ("arm64", "aarch64")
+    if sys.platform.startswith("win"):
+        so_bom, ext_boa = ("windows", "win"), (".zip",)
+    elif sys.platform == "darwin":
+        so_bom, ext_boa = ("darwin", "apple", "macos"), (".tar.gz", ".zip")
+    else:
+        so_bom, ext_boa = ("linux",), (".tar.gz", ".tgz", ".zip")
+    melhor, melhor_pontos = None, -1
+    for a in assets:
+        nome = a["nome"].lower()
+        if not nome.endswith(ext_boa):
+            continue
+        if not any(s in nome for s in so_bom):
+            continue
+        if any(x in nome for x in (".sha256", ".sig", ".asc", ".deb", ".rpm", ".msi")):
+            continue
+        pontos = 0
+        tem_arm = ("arm64" in nome or "aarch64" in nome)
+        if eh_arm != tem_arm:
+            continue
+        if "x86_64" in nome or "amd64" in nome or "x64" in nome:
+            pontos += 2 if not eh_arm else 0
+        if "musl" in nome:  # estatico: roda em qualquer Linux
+            pontos += 3
+        if "gnu" in nome:
+            pontos += 1
+        if pontos > melhor_pontos:
+            melhor, melhor_pontos = a, pontos
+    return melhor
+
+
+def _instalar_binario(nome_lib: str, info: dict) -> bool:
+    """Baixa a release, extrai o binario e coloca na pasta de bin do usuario."""
+    import io
+    import tarfile
+    import zipfile
+    destino_dir = _dir_bin()
+    destino_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        assets = _release_assets(info["repo"])
+    except (RuntimeError, json.JSONDecodeError, OSError) as e:
+        print(f"  {nome_lib}: falhou ao listar releases de {info['repo']}: {e}", file=sys.stderr)
+        return False
+    asset = _escolher_asset(assets)
+    if not asset:
+        print(f"  {nome_lib}: nenhum asset compativel com esta maquina em "
+              f"github.com/{info['repo']}/releases — instale na mao "
+              f"(assets: {', '.join(a['nome'] for a in assets[:8]) or 'nenhum'})", file=sys.stderr)
+        return False
+    print(f"  {nome_lib}: baixando {asset['nome']}...")
+    try:
+        blob = _baixar_url(asset["url"])
+    except OSError as e:
+        print(f"  {nome_lib}: download falhou ({e})", file=sys.stderr)
+        return False
+
+    sufixo_exe = ".exe" if os.name == "nt" else ""
+    alvos = {b + sufixo_exe for b in info["binarios"]}
+    achou = False
+    try:
+        if asset["nome"].lower().endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(blob)) as z:
+                for membro in z.namelist():
+                    base = Path(membro).name
+                    if base in alvos:
+                        (destino_dir / base).write_bytes(z.read(membro))
+                        achou = True
+        else:
+            with tarfile.open(fileobj=io.BytesIO(blob), mode="r:*") as t:
+                for membro in t.getmembers():
+                    base = Path(membro.name).name
+                    if membro.isfile() and base in alvos:
+                        fh = t.extractfile(membro)
+                        if fh:
+                            (destino_dir / base).write_bytes(fh.read())
+                            achou = True
+    except (tarfile.TarError, zipfile.BadZipFile, OSError) as e:
+        print(f"  {nome_lib}: falha ao extrair ({e})", file=sys.stderr)
+        return False
+    if not achou:
+        print(f"  {nome_lib}: o pacote {asset['nome']} nao continha "
+              f"{'/'.join(sorted(alvos))}", file=sys.stderr)
+        return False
+    for b in alvos:
+        caminho = destino_dir / b
+        if caminho.exists() and os.name != "nt":
+            caminho.chmod(0o755)
+    print(f"  {nome_lib}: instalado em {destino_dir}")
+    if shutil.which(info["checar"]) is None:
+        if os.name == "nt":
+            print(f"  atencao: {destino_dir} nao esta no PATH. Rode: "
+                  f'setx PATH "%PATH%;{destino_dir}"  (e abra novo terminal)')
+        else:
+            print(f"  atencao: {destino_dir} nao esta no PATH desta sessao.")
+    return True
+
+
+def _instalar_npm(nome_lib: str, pacote: str) -> bool:
+    if shutil.which("npm") is None:
+        print(f"  {nome_lib}: precisa do npm (nao achei no PATH)", file=sys.stderr)
+        return False
+    print(f"  {nome_lib}: npm install -g {pacote} ...")
+    r = subprocess.run(["npm", "install", "-g", pacote], capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        print(f"  {nome_lib}: npm falhou: {r.stderr.strip()[:300]}", file=sys.stderr)
+        return False
+    print(f"  {nome_lib}: instalado via npm")
+    return True
+
+
+def cmd_libs_status(args) -> int:
+    print(f"\n  pasta de binarios do usuario: {_dir_bin()}"
+          f"{'' if str(_dir_bin()) in os.environ.get('PATH', '') else '  (FORA do PATH!)'}\n")
+    for nome, info in LIBS.items():
+        onde = shutil.which(info["checar"])
+        estado = f"{VERDE}ok{FIM}  {onde}" if onde else f"{VERMELHO}falta{FIM}"
+        print(f"  {nome:<10} {estado}")
+        print(f"  {'':<10} {CINZA}{info['para_que']}{FIM}")
+    print(f"\n  instalar/atualizar: python3 copiloto.py libs instalar [nome ...|--todas]")
+    print("  (sem admin: binarios vao para a pasta acima; ast-grep/repomix via npm se houver)\n")
+    return 0
+
+
+def cmd_libs_instalar(args) -> int:
+    nomes = list(LIBS) if args.todas or not args.nomes else args.nomes
+    invalidos = [n for n in nomes if n not in LIBS]
+    if invalidos:
+        print(f"erro: lib(s) desconhecida(s): {', '.join(invalidos)}. "
+              f"Opcoes: {', '.join(LIBS)}", file=sys.stderr)
+        return 2
+    falhas = 0
+    for nome in nomes:
+        info = LIBS[nome]
+        ok = False
+        if "repo" in info:
+            ok = _instalar_binario(nome, info)
+        if not ok and info.get("npm"):
+            ok = _instalar_npm(nome, info["npm"])
+        if not ok:
+            falhas += 1
+    print()
+    cmd_libs_status(args)
+    return 1 if falhas else 0
+
+
+def contexto_libs() -> str:
+    """Bloco injetado nos prompts: diz ao modelo quais ferramentas de economia
+    existem NESTA maquina e como usa-las. E assim que as libs sao 'usadas'."""
+    linhas = []
+    if shutil.which("rtk"):
+        linhas.append("- `rtk`: prefixe comandos de terminal com rtk (ex.: `rtk git log`, "
+                      "`rtk npm test`) para receber a saida comprimida — gasta bem menos tokens.")
+    if shutil.which("rg"):
+        linhas.append("- `rg` (ripgrep): busque com rg antes de abrir qualquer arquivo; "
+                      "leia so os trechos que ele apontar.")
+    if shutil.which("ast-grep"):
+        linhas.append("- `ast-grep`: para achar/alterar padroes estruturais de codigo "
+                      "(ex.: `ast-grep run -p 'foo($X)' -l py`), em vez de ler arquivos inteiros.")
+    if not linhas:
+        return ""
+    return ("\n\n--- FERRAMENTAS DE ECONOMIA DISPONIVEIS NESTA MAQUINA (use-as) ---\n"
+            + "\n".join(linhas) + "\n")
 
 
 # =========================================================================== #
@@ -1842,6 +2062,16 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("atualizar", help=f"baixa a versao mais nova do GitHub ({REPO_ATUALIZACAO})")
     sp.set_defaults(func=cmd_atualizar)
 
+    # ---- libs ----
+    libs = sub.add_parser("libs", help="acessorios de economia: status, instalar/atualizar")
+    lsub = libs.add_subparsers(dest="libs_cmd")
+    sp = lsub.add_parser("status", help="o que esta instalado nesta maquina")
+    sp.set_defaults(func=cmd_libs_status, todas=False, nomes=[])
+    sp = lsub.add_parser("instalar", help="instala/atualiza (release do GitHub ou npm), sem admin")
+    sp.add_argument("nomes", nargs="*", help=f"quais ({', '.join(LIBS)}); vazio + --todas = todas")
+    sp.add_argument("--todas", action="store_true")
+    sp.set_defaults(func=cmd_libs_instalar)
+
     # ---- mapa ----
     sp = sub.add_parser("mapa", help="gera MAPA.md local (aceita varios repos)")
     sp.add_argument("raizes", nargs="*", help="raizes dos repos (padrao: .)")
@@ -1908,6 +2138,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "orcamento" and not getattr(args, "orc_cmd", None):
         orc.print_help()
+        return 0
+    if args.cmd == "libs" and not getattr(args, "libs_cmd", None):
+        libs.print_help()
         return 0
     return args.func(args)
 
