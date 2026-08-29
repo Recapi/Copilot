@@ -24,12 +24,15 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
+import time
 import datetime as dt
 from pathlib import Path
 
@@ -42,30 +45,35 @@ PLANO = Path("plano.md")
 
 PADRAO = {
     "_comentario": (
-        "'cmd' de cada papel: {prompt} vira o texto do prompt e {usage_file} (opcional) "
-        "vira um JSON com o consumo real da chamada (--usage-output-file do Copilot CLI). "
-        "'custo' e a ESTIMATIVA em creditos usada pelo portao de orcamento ANTES de chamar; "
-        "se o usage_file trouxer o consumo real, e ele que e registrado. "
+        "'cmd' de cada papel: o prompt e enviado por STDIN (sem limite de tamanho de "
+        "linha de comando). Se a sua versao do CLI nao aceitar prompt por stdin, "
+        "acrescente '-p', '{prompt}' ao cmd para envia-lo como argumento. "
+        "{usage_file} vira um JSON com o consumo real da chamada (--usage-output-file). "
+        "'custo' e a ESTIMATIVA em creditos usada pelo portao de orcamento ANTES de "
+        "chamar; se o usage_file trouxer o consumo real, e ele que e registrado. "
+        "'reusar_sessao' encadeia as chamadas de cada papel na mesma sessao do copilot "
+        "(--resume), aproveitando o cache de contexto (~10% do preco do input). "
         "Confira os nomes de modelos disponiveis com /model dentro do copilot."
     ),
     "papeis": {
         "planejador": {
-            "cmd": ["copilot", "-p", "{prompt}", "--model", "claude-sonnet-4.6", "-s",
+            "cmd": ["copilot", "--model", "claude-sonnet-4.6", "-s",
                     "--usage-output-file", "{usage_file}"],
             "custo": 40.0,
         },
         "executor": {
-            "cmd": ["copilot", "-p", "{prompt}", "--model", "gpt-5-mini", "-s",
-                    "--allow-all-tools", "--usage-output-file", "{usage_file}"],
+            "cmd": ["copilot", "--model", "gpt-5-mini", "-s", "--allow-all-tools",
+                    "--usage-output-file", "{usage_file}"],
             "custo": 10.0,
         },
         "validador": {
-            "cmd": ["copilot", "-p", "{prompt}", "--model", "claude-sonnet-4.6", "-s",
+            "cmd": ["copilot", "--model", "claude-sonnet-4.6", "-s",
                     "--usage-output-file", "{usage_file}"],
             "custo": 25.0,
         },
     },
     "verificacoes": [],
+    "reusar_sessao": True,
     "max_tentativas_executor": 2,
     "max_rodadas_ajuste": 2,
     "timeout_seg": 900,
@@ -181,37 +189,86 @@ def _creditos_do_usage(caminho: Path) -> float | None:
     return None
 
 
+SESSOES: dict[str, str] = {}  # papel -> id da sessao do copilot criada nesta execucao
+
+
+def _dir_sessoes() -> Path:
+    return Path(os.environ.get("COPILOT_HOME", str(Path.home() / ".copilot"))) / "session-state"
+
+
+def _capturar_sessao(papel: str, inicio: float) -> None:
+    """Guarda o id da sessao que o copilot criou nesta chamada.
+
+    O CLI grava cada sessao em ~/.copilot/session-state/<id>/; a desta chamada
+    e a mais recente com mtime posterior ao inicio dela. Melhor esforco: se o
+    diretorio nao existir ou nada bater, seguimos sem reuso de sessao.
+    """
+    if papel in SESSOES:
+        return
+    ja_reivindicadas = set(SESSOES.values())
+    try:
+        candidatos = [d for d in _dir_sessoes().iterdir()
+                      if d.is_dir() and d.name not in ja_reivindicadas
+                      and d.stat().st_mtime >= inicio - 2]
+    except OSError:
+        return
+    if candidatos:
+        SESSOES[papel] = max(candidatos, key=lambda d: d.stat().st_mtime).name
+
+
+def tem_sessao(papel: str) -> bool:
+    """True se as proximas chamadas deste papel vao continuar uma sessao existente."""
+    return papel in SESSOES
+
+
 def chamar(cfg: dict, papel: str, prompt: str, forcar: bool, nota: str) -> str:
     conf = cfg["papeis"][papel]
     custo = float(conf.get("custo", 0))
     portao(custo, f"{papel}: {nota}", forcar)
 
     usage_file = None
+    via_argv = any("{prompt}" in parte for parte in conf["cmd"])
     cmd = []
     for parte in conf["cmd"]:
         if "{usage_file}" in parte:
             if usage_file is None:
-                fd, tmp = __import__("tempfile").mkstemp(prefix="harness-usage-", suffix=".json")
+                fd, tmp = tempfile.mkstemp(prefix="harness-usage-", suffix=".json")
                 os.close(fd)
                 usage_file = Path(tmp)
             parte = parte.replace("{usage_file}", str(usage_file))
         cmd.append(parte.replace("{prompt}", prompt))
+    entrada = None if via_argv else prompt
+
+    reusar = bool(cfg.get("reusar_sessao", True))
+    if reusar and papel in SESSOES:
+        cmd += ["--resume", SESSOES[papel]]
+
     modelo = next((cmd[i + 1] for i, p in enumerate(cmd) if p == "--model" and i + 1 < len(cmd)), papel)
 
     print(f"\n>> {papel} ({modelo}, estimado {custo:g}) — {nota}")
     if os.environ.get("HARNESS_DRY_RUN"):
-        print(f"   [dry-run] {shlex.join(cmd)[:300]}")
+        origem = "argv" if via_argv else f"stdin, {len(prompt)} chars"
+        print(f"   [dry-run] {shlex.join(cmd)[:300]}  (prompt via {origem})")
+        if usage_file:
+            usage_file.unlink(missing_ok=True)
         return "[dry-run] sem saida"
 
+    inicio = time.time()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, input=entrada, capture_output=True, text=True,
                            timeout=int(cfg.get("timeout_seg", 900)))
     except FileNotFoundError:
         print(f"erro: comando '{cmd[0]}' nao encontrado. Ajuste 'cmd' em {CONFIG}.", file=sys.stderr)
         sys.exit(2)
     except subprocess.TimeoutExpired:
+        if usage_file:
+            usage_file.unlink(missing_ok=True)
         cobrar(custo, modelo, f"{nota} (timeout)")
         raise RuntimeError(f"{papel} estourou o timeout")
+    # So captura sessao de chamada bem-sucedida: uma falha rapida (auth, modelo
+    # invalido) nao cria sessao, e capturar aqui pegaria a sessao de outro papel.
+    if reusar and r.returncode == 0:
+        _capturar_sessao(papel, inicio)
 
     # Registra o consumo REAL se o CLI informou; senao, a estimativa.
     # Cobra mesmo em erro: a chamada foi consumida do mesmo jeito.
@@ -354,14 +411,19 @@ def executar_passo(cfg: dict, passo: dict, forcar: bool) -> str:
         return "bloqueado"
 
     # Ciclo barato: enquanto a verificacao local falhar, o executor barato tenta
-    # de novo. Isso nao custa nada do modelo caro.
+    # de novo. Isso nao custa nada do modelo caro. Com sessao ativa, o follow-up
+    # e curto — o contexto do passo ja esta na sessao do copilot.
     ok, relatorio = verificar(verificacoes)
     tentativa = 0
     while not ok and tentativa < int(cfg["max_tentativas_executor"]):
         tentativa += 1
         print(f"   verificacao falhou — devolvendo ao executor barato (tentativa {tentativa})")
-        chamar(cfg, "executor", instrucao + f"\n\n--- A VERIFICACAO FALHOU, CORRIJA ---\n{relatorio}",
-               forcar, f"passo {passo['n']} correcao {tentativa}")
+        if tem_sessao("executor"):
+            prompt_corr = ("A verificacao local do passo em que voce estava trabalhando "
+                           f"falhou. Corrija e rode a verificacao de novo.\n\n{relatorio}")
+        else:
+            prompt_corr = instrucao + f"\n\n--- A VERIFICACAO FALHOU, CORRIJA ---\n{relatorio}"
+        chamar(cfg, "executor", prompt_corr, forcar, f"passo {passo['n']} correcao {tentativa}")
         ok, relatorio = verificar(verificacoes)
     if not ok:
         print("   executor barato nao resolveu; escalando para o validador")
@@ -385,37 +447,85 @@ def executar_passo(cfg: dict, passo: dict, forcar: bool) -> str:
             return "reprovado"
         print(f"   AJUSTAR (rodada {rodada})")
         ajustes = veredito_txt
-        chamar(cfg, "executor", ler_prompt("02-executar.md") + "\n\n--- APLIQUE ESTES AJUSTES ---\n" + ajustes,
-               forcar, f"ajuste passo {passo['n']} rodada {rodada}")
+        if tem_sessao("executor"):
+            prompt_aj = ("O validador revisou o seu trabalho neste passo e pediu os "
+                         "ajustes abaixo. Aplique-os e rode a verificacao local.\n\n" + ajustes)
+        else:
+            prompt_aj = ler_prompt("02-executar.md") + "\n\n--- APLIQUE ESTES AJUSTES ---\n" + ajustes
+        chamar(cfg, "executor", prompt_aj, forcar, f"ajuste passo {passo['n']} rodada {rodada}")
         ok, relatorio = verificar(verificacoes)
 
     print("   limite de rodadas de ajuste atingido")
     return "ajustado"
 
 
+PROGRESSO = Path("progresso.json")
+
+
+def _sha_plano() -> str:
+    return hashlib.sha256(PLANO.read_bytes()).hexdigest()
+
+
+def carregar_progresso(sha: str) -> dict[int, str]:
+    if not PROGRESSO.exists():
+        return {}
+    try:
+        dados = json.loads(PROGRESSO.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if dados.get("plano_sha") != sha:
+        print("plano.md mudou desde a ultima execucao — progresso anterior descartado")
+        return {}
+    return {int(k): v for k, v in dados.get("resultados", {}).items()}
+
+
+def salvar_progresso(sha: str, resultados: dict[int, str]) -> None:
+    PROGRESSO.write_text(
+        json.dumps({"plano_sha": sha, "resultados": {str(k): v for k, v in resultados.items()}},
+                   indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
 def cmd_rodar(args) -> int:
     cfg = carregar()
     passos = ler_passos()
+    sha = _sha_plano()
+    anteriores = carregar_progresso(sha)
     if args.passo:
         passos = [p for p in passos if p["n"] == args.passo]
         if not passos:
             print(f"erro: passo {args.passo} nao existe no plano", file=sys.stderr)
             return 2
+    if args.refazer:
+        # Refaz so os passos selecionados; aprovacoes dos demais ficam de pe.
+        for p in passos:
+            anteriores.pop(p["n"], None)
 
-    resultados = {}
+    resultados = dict(anteriores)
     for passo in passos:
+        # Passo ja aprovado numa execucao anterior nao roda (nem paga) de novo.
+        if anteriores.get(passo["n"]) == "aprovado":
+            print(f"passo {passo['n']} ja aprovado em execucao anterior — pulando "
+                  "(use --refazer para repetir)")
+            continue
         try:
             resultados[passo["n"]] = executar_passo(cfg, passo, args.forcar)
         except SemOrcamento as e:
             print(f"\n[ORCAMENTO] {e}", file=sys.stderr)
             resultados[passo["n"]] = "sem-orcamento"
+            if not os.environ.get("HARNESS_DRY_RUN"):
+                salvar_progresso(sha, resultados)
             break
+        # Dry-run nao persiste: um ensaio nao pode rasurar aprovacoes reais.
+        if not os.environ.get("HARNESS_DRY_RUN"):
+            salvar_progresso(sha, resultados)
 
     print(f"\n{'=' * 70}\nRESUMO")
     for p in passos:
         print(f"  passo {p['n']}: {resultados.get(p['n'], 'nao rodou')}  — {p['titulo']}")
     orcamento.imprimir(orcamento.calcular(orcamento.carregar_config()), orcamento.carregar_config())
-    return 0 if all(v == "aprovado" for v in resultados.values()) else 1
+    return 0 if all(resultados.get(p["n"]) == "aprovado" for p in passos) else 1
 
 
 def cmd_custo(args) -> int:
@@ -439,6 +549,8 @@ def main() -> int:
     sp = sub.add_parser("rodar", help="executa (barato) e valida (caro) os passos")
     sp.add_argument("--passo", type=int)
     sp.add_argument("--forcar", action="store_true")
+    sp.add_argument("--refazer", action="store_true",
+                    help="ignora o progresso salvo e roda tudo de novo")
     sp.set_defaults(func=cmd_rodar)
 
     sp = sub.add_parser("custo", help="status do orcamento")

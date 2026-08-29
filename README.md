@@ -102,7 +102,14 @@ python3 orcamento.py gasto 120 --modelo claude-sonnet --nota "refactor X"
 python3 orcamento.py pode 300 && copilot -p "..."   # portão p/ scripts (exit 0/1)
 python3 orcamento.py plano       # distribuição dia a dia até o fim do mês
 python3 orcamento.py resumo      # gasto por dia e por modelo
+python3 orcamento.py sincronizar # puxa o consumo REAL do mês via `gh api` e
+                                 # ajusta o registro local (pega o que você
+                                 # gastou fora do harness: VS Code, site...)
 ```
+
+O `sincronizar` precisa do `gh` autenticado (`gh auth login`; se reclamar de
+escopo, `gh auth refresh -h github.com -s user`). É idempotente: rode quantas
+vezes quiser, a diferença converge para zero.
 
 A fórmula: `permitido_hoje = (restante − reserva) / dias_uteis_restantes`.
 Recalculada todo dia, ela se corrige sozinha: economizou ontem → hoje pode
@@ -119,6 +126,19 @@ python3 harness.py planejar "adicionar retry com backoff no cliente HTTP"
 python3 harness.py rodar                       # executa e valida passo a passo
 python3 harness.py custo                       # como ficou o orçamento
 ```
+
+Três comportamentos que economizam de verdade:
+
+- **Prompt via stdin** — o prompt (que embute o MAPA.md) vai por stdin, não por
+  argumento; no Windows a linha de comando estoura em ~32 KB e via stdin não há
+  limite. Se a sua versão do CLI não aceitar prompt por stdin, acrescente
+  `"-p", "{prompt}"` ao `cmd` do papel em `harness.json`.
+- **Sessão reutilizada** — cada papel continua a própria sessão do copilot
+  (`--resume`) dentro de uma execução: o contexto não é reenviado inteiro a
+  cada chamada (input em cache custa ~10%), e correções viram follow-ups curtos.
+- **Progresso salvo** (`progresso.json`) — se a execução parar no passo 3, rodar
+  de novo pula (e não paga) os passos já aprovados. `--refazer` ignora isso;
+  mudou o `plano.md`, o progresso é descartado sozinho.
 
 Configure os modelos em `harness.json` (papel → comando + custo estimado).
 Modelos que a pesquisa encontrou no CLI hoje: fortes = `claude-sonnet-4.6`,

@@ -1,11 +1,9 @@
 {
-  "_comentario": "'cmd' de cada papel: {prompt} vira o texto do prompt e {usage_file} (opcional) vira um JSON com o consumo real da chamada (--usage-output-file do Copilot CLI). 'custo' e a ESTIMATIVA em creditos usada pelo portao de orcamento ANTES de chamar; se o usage_file trouxer o consumo real, e ele que e registrado. Confira os nomes de modelos disponiveis com /model dentro do copilot.",
+  "_comentario": "'cmd' de cada papel: o prompt e enviado por STDIN (sem limite de tamanho de linha de comando). Se a sua versao do CLI nao aceitar prompt por stdin, acrescente '-p', '{prompt}' ao cmd para envia-lo como argumento. {usage_file} vira um JSON com o consumo real da chamada (--usage-output-file). 'custo' e a ESTIMATIVA em creditos usada pelo portao de orcamento ANTES de chamar; se o usage_file trouxer o consumo real, e ele que e registrado. 'reusar_sessao' encadeia as chamadas de cada papel na mesma sessao do copilot (--resume), aproveitando o cache de contexto (~10% do preco do input). Confira os nomes de modelos disponiveis com /model dentro do copilot.",
   "papeis": {
     "planejador": {
       "cmd": [
         "copilot",
-        "-p",
-        "{prompt}",
         "--model",
         "claude-sonnet-4.6",
         "-s",
@@ -17,8 +15,6 @@
     "executor": {
       "cmd": [
         "copilot",
-        "-p",
-        "{prompt}",
         "--model",
         "gpt-5-mini",
         "-s",
@@ -31,8 +27,6 @@
     "validador": {
       "cmd": [
         "copilot",
-        "-p",
-        "{prompt}",
         "--model",
         "claude-sonnet-4.6",
         "-s",
@@ -43,6 +37,7 @@
     }
   },
   "verificacoes": [],
+  "reusar_sessao": true,
   "max_tentativas_executor": 2,
   "max_rodadas_ajuste": 2,
   "timeout_seg": 900

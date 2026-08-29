@@ -17,6 +17,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import re
 import subprocess
@@ -102,6 +103,42 @@ def listar_arquivos(raiz: Path) -> list[Path]:
     return arquivos
 
 
+def extrair_python(texto: str, max_simbolos: int) -> tuple[list[str], list[str]] | None:
+    """Simbolos e imports de um arquivo Python via ast (pega metodos de classe).
+
+    Retorna None se o arquivo nao parsear (Python 2, template, arquivo quebrado)
+    para o chamador cair no caminho de regex.
+    """
+    try:
+        arvore = ast.parse(texto)
+    except (SyntaxError, ValueError):
+        return None
+
+    simbolos: list[str] = []
+    for no in arvore.body:
+        if isinstance(no, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not no.name.startswith("_"):
+                simbolos.append(no.name)
+        elif isinstance(no, ast.ClassDef):
+            if no.name.startswith("_"):
+                continue
+            simbolos.append(no.name)
+            for filho in no.body:
+                if isinstance(filho, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and not filho.name.startswith("_"):
+                    simbolos.append(f"{no.name}.{filho.name}")
+    if len(simbolos) > max_simbolos:
+        simbolos = simbolos[:max_simbolos] + ["..."]
+
+    imports: list[str] = []
+    for no in ast.walk(arvore):
+        if isinstance(no, ast.Import):
+            imports += [alias.name for alias in no.names]
+        elif isinstance(no, ast.ImportFrom) and no.module and no.level == 0:
+            imports.append(no.module)
+    return simbolos, imports
+
+
 def extrair(caminho: Path, max_simbolos: int) -> tuple[int, list[str], list[str]]:
     """Retorna (linhas, simbolos de topo, imports)."""
     ext = caminho.suffix.lower()
@@ -114,6 +151,11 @@ def extrair(caminho: Path, max_simbolos: int) -> tuple[int, list[str], list[str]
     linhas = texto.count("\n") + 1
     if not lingua:
         return linhas, [], []
+
+    if ext == ".py":
+        preciso = extrair_python(texto, max_simbolos)
+        if preciso is not None:
+            return linhas, preciso[0], preciso[1]
 
     padroes = [re.compile(p) for p in lingua[1]]
     simbolos: list[str] = []

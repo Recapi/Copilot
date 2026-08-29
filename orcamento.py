@@ -25,6 +25,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -409,6 +410,101 @@ def cmd_resumo(args) -> int:
     return 0
 
 
+def _gh(argumentos: list[str]) -> str:
+    try:
+        r = subprocess.run(["gh"] + argumentos, capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        raise RuntimeError("o comando 'gh' (GitHub CLI) nao esta instalado ou nao esta no PATH")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("gh demorou demais para responder")
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip()[:500] or f"gh saiu com codigo {r.returncode}")
+    return r.stdout
+
+
+def consumo_api(login: str, ano: int, mes: int) -> tuple[float, int]:
+    """Consumo de AI Credits do mes segundo a API de billing do GitHub.
+
+    Usa GET /users/{login}/settings/billing/ai_credit/usage. A resposta traz
+    usageItems com grossQuantity (total), discountQuantity (coberto pela cota
+    do plano) e netQuantity (excedente cobrado). Parsing defensivo: o formato
+    e recente e pode ganhar campos.
+    """
+    saida = _gh([
+        "api", f"/users/{login}/settings/billing/ai_credit/usage?year={ano}&month={mes}",
+        "-H", "X-GitHub-Api-Version: 2026-03-10",
+    ])
+    dados = json.loads(saida)
+    itens = None
+    if isinstance(dados, list):
+        itens = dados
+    elif isinstance(dados, dict):
+        for chave, valor in dados.items():
+            if isinstance(valor, list) and "item" in chave.lower():
+                itens = valor
+                break
+    if itens is None:
+        chaves = sorted(dados)[:8] if isinstance(dados, dict) else type(dados).__name__
+        raise RuntimeError(f"resposta sem lista de usageItems (topo: {chaves})")
+    total = 0.0
+    for item in itens:
+        if not isinstance(item, dict):
+            continue
+        bruto = item.get("grossQuantity")
+        if bruto is None:
+            bruto = float(item.get("discountQuantity") or 0) + float(item.get("netQuantity") or 0)
+        total += float(bruto or 0)
+    return total, len(itens)
+
+
+def cmd_sincronizar(args) -> int:
+    """Ajusta o registro local para bater com o consumo real medido pelo GitHub.
+
+    O uso.jsonl so conhece o que foi registrado aqui; o que voce gastar no
+    VS Code ou no site fica de fora. Este comando busca o total do mes na API
+    e registra a diferenca como um lancamento de sincronizacao. Rodar de novo
+    e idempotente: a diferenca converge para zero.
+    """
+    cfg = carregar_config()
+    hoje = args.data or dt.date.today()
+    if int(cfg["dia_reset"]) != 1:
+        print(f"aviso: dia_reset={cfg['dia_reset']}, mas a API do GitHub agrega por mes "
+              "civil (a cota do Copilot reseta dia 1 UTC) — sincronizando o mes de hoje.",
+              file=sys.stderr)
+
+    try:
+        login = args.login or _gh(["api", "user", "--jq", ".login"]).strip()
+        total_api, n_itens = consumo_api(login, hoje.year, hoje.month)
+    except (RuntimeError, json.JSONDecodeError) as e:
+        print(f"erro ao consultar a API de billing: {e}", file=sys.stderr)
+        print("Dicas: 'gh auth login' primeiro; se a conta e corporativa, o endpoint de "
+              "usuario pode nao expor o consumo (peca ao admin) — nesse caso registre na "
+              "mao com 'gasto'. Planos anuais legados usam premium_request/usage em vez "
+              "de ai_credit/usage.", file=sys.stderr)
+        return 1
+
+    # Compara mes civil com mes civil: a API agrega por mes, entao o total local
+    # tambem precisa ser o do mes de hoje (nao o do ciclo, que pode comecar em
+    # outro dia). O lancamento de ajuste e datado de hoje, que pertence aos dois
+    # recortes — os syncs seguintes convergem.
+    inicio_mes = hoje.replace(day=1)
+    prox_mes = _clamp_dia(hoje.year, hoje.month, 31) + dt.timedelta(days=1)
+    local = sum(float(u["qtd"]) for u in ler_uso()
+                if inicio_mes.isoformat() <= u["data"] < prox_mes.isoformat())
+    diferenca = round(total_api - local, 4)
+    print(f"API ({login}, {hoje.year}-{hoje.month:02d}): {total_api:g} {cfg['unidade']} "
+          f"em {n_itens} itens | registrado localmente: {local:g}")
+    if abs(diferenca) < 0.005:
+        print("ja esta em dia — nada a ajustar")
+    else:
+        registrar(diferenca, "(sincronizacao)", f"ajuste para bater com a API ({total_api:g} no mes)", hoje)
+        verbo = "acrescentado" if diferenca > 0 else "abatido"
+        print(f"{verbo} {abs(diferenca):g} para bater com a API")
+    s = calcular(cfg, hoje)
+    imprimir(s, cfg)
+    return 0
+
+
 def data_arg(s: str) -> dt.date:
     return dt.date.fromisoformat(s)
 
@@ -454,6 +550,12 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("resumo", help="uso por dia e por modelo no ciclo")
     add_data(sp)
     sp.set_defaults(func=cmd_resumo)
+
+    sp = sub.add_parser("sincronizar",
+                        help="puxa o consumo real do mes via 'gh api' e ajusta o registro local")
+    sp.add_argument("--login", help="login do GitHub (padrao: o da sessao do gh)")
+    add_data(sp)
+    sp.set_defaults(func=cmd_sincronizar)
 
     args = p.parse_args(argv)
     if not getattr(args, "cmd", None):
