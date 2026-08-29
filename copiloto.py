@@ -62,7 +62,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-VERSAO = "2026.08.29.2"
+VERSAO = "2026.08.29.3"
 REPO_ATUALIZACAO = os.environ.get("COPILOTO_REPO", "Recapi/Copilot")
 
 # --------------------------------------------------------------------------- #
@@ -1707,24 +1707,46 @@ def cmd_sessao(args) -> int:
     return codigo
 
 
+def _parece_copiloto(texto: str) -> bool:
+    """O arquivo baixado precisa parecer este programa (e uma versao que ja
+    tenha auto-update, para nao regredir)."""
+    return "copiloto.py" in texto[:2000] and "def cmd_atualizar(" in texto
+
+
 def _baixar_atualizacao() -> str:
-    """Baixa o copiloto.py mais novo do GitHub. Tenta HTTPS direto (urllib
-    respeita HTTPS_PROXY do ambiente) e cai para o gh CLI se falhar."""
-    url = f"https://raw.githubusercontent.com/{REPO_ATUALIZACAO}/main/copiloto.py"
+    """Baixa o copiloto.py mais novo do GitHub.
+
+    Tenta HTTPS direto (urllib respeita HTTPS_PROXY do ambiente) com
+    cache-buster — a CDN do raw.githubusercontent segura versao antiga por
+    alguns minutos — e cai para o gh CLI (API, sempre fresca) se o direto
+    falhar ou vier conteudo que nao parece este programa.
+    """
+    erro_http: Exception | None = None
     try:
         import urllib.request
+        url = (f"https://raw.githubusercontent.com/{REPO_ATUALIZACAO}/main/"
+               f"copiloto.py?nocache={int(time.time())}")
         with urllib.request.urlopen(url, timeout=30) as resposta:
-            return resposta.read().decode("utf-8")
+            texto = resposta.read().decode("utf-8")
+        if _parece_copiloto(texto):
+            return texto
+        erro_http = RuntimeError("conteudo baixado nao parece o copiloto.py "
+                                 "(cache da CDN? tentando via gh)")
     except Exception as e:  # inclui SSL de inspecao corporativa
         erro_http = e
     try:
-        return _gh(["api", f"repos/{REPO_ATUALIZACAO}/contents/copiloto.py",
-                    "-H", "Accept: application/vnd.github.raw+json"])
+        texto = _gh(["api", f"repos/{REPO_ATUALIZACAO}/contents/copiloto.py",
+                     "-H", "Accept: application/vnd.github.raw+json"])
+        if _parece_copiloto(texto):
+            return texto
+        raise RuntimeError("a versao no GitHub nao tem o comando 'atualizar' — "
+                           "confira o repo/branch")
     except RuntimeError as erro_gh:
         raise RuntimeError(
             f"download direto falhou ({type(erro_http).__name__}: {erro_http}) e o gh "
             f"tambem ({erro_gh}). Atras de proxy/inspecao SSL, configure HTTPS_PROXY e "
-            f"SSL_CERT_FILE com a CA da empresa, ou use o gh autenticado.")
+            f"SSL_CERT_FILE com a CA da empresa, use o gh autenticado, ou espere uns "
+            f"minutos (cache da CDN apos um push recente).")
 
 
 def cmd_atualizar(args) -> int:
@@ -1739,10 +1761,7 @@ def cmd_atualizar(args) -> int:
         print(f"erro: {e}", file=sys.stderr)
         return 1
 
-    # Sanidade antes de se sobrescrever: precisa parecer este programa e compilar.
-    if "def cmd_atualizar(" not in novo or "copiloto.py" not in novo[:2000]:
-        print("erro: o arquivo baixado nao parece ser o copiloto.py — abortando.", file=sys.stderr)
-        return 1
+    # Sanidade antes de se sobrescrever: precisa compilar.
     try:
         compile(novo, "copiloto.py", "exec")
     except SyntaxError as e:
