@@ -63,7 +63,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-VERSAO = "2026.08.29.6"
+VERSAO = "2026.08.29.7"
 REPO_ATUALIZACAO = os.environ.get("COPILOTO_REPO", "Recapi/Copilot")
 
 # --------------------------------------------------------------------------- #
@@ -1886,26 +1886,28 @@ def cmd_harness_init(args) -> int:
     if CONFIG_PROJETO.exists() and not args.sobrescrever:
         print(f"{CONFIG_PROJETO} ja existe (use --sobrescrever para regenerar)")
         return 0
-    cfg = json.loads(json.dumps(PADRAO_HARNESS))
-    if CONFIG_HARNESS_GLOBAL.exists():
-        try:
-            cfg.update(json.loads(CONFIG_HARNESS_GLOBAL.read_text(encoding="utf-8")))
-        except json.JSONDecodeError:
-            pass
+    # O arquivo do projeto guarda so o que e DO projeto (repos, verificacoes).
+    # Modelos dos papeis ficam no padrao geral (~/.copiloto/harness.json) para a
+    # escolha feita no menu valer em todo lugar — a nao ser que o usuario salve
+    # modelos especificos deste projeto pelo proprio menu.
+    dados = _carregar_config_projeto_bruta()
     repos = args.repo or ["."]
-    cfg["repos"] = repos
-    cfg["add_dirs"] = [r for r in repos if r != "."]
+    dados["_comentario"] = (
+        "Config DO PROJETO (versionavel). Modelos dos papeis ficam no padrao "
+        "geral em ~/.copiloto/harness.json — mude pelo menu 'Escolher modelos'."
+    )
+    dados["repos"] = repos
+    dados["add_dirs"] = [r for r in repos if r != "."]
     detectadas = []
     for r in repos:
         detectadas += detectar_verificacoes(Path(r))
+    dados["verificacoes"] = detectadas
     if detectadas:
-        cfg["verificacoes"] = detectadas
         print("verificacoes locais detectadas:")
         for v in detectadas:
             print(f"  - {v}")
-    CONFIG_PROJETO.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _salvar_config_projeto(dados)
     print(f"\nconfig do projeto em {CONFIG_PROJETO.resolve()}")
-    print("Ajuste os nomes dos modelos em 'papeis' antes de rodar de verdade.")
     return 0
 
 
@@ -2638,10 +2640,10 @@ def _menu_orcamento() -> None:
                 print("  valores invalidos, nada alterado")
 
 
-def _ler_config_alvo() -> tuple[Path, dict]:
-    """Onde salvar escolhas de modelo: no copiloto.json do projeto se existir,
-    senao no harness.json pessoal."""
-    alvo = CONFIG_PROJETO if CONFIG_PROJETO.exists() else CONFIG_HARNESS_GLOBAL
+def _ler_config_alvo(global_: bool) -> tuple[Path, dict]:
+    """Onde salvar escolhas de modelo: padrao geral (~/.copiloto/harness.json)
+    ou so deste projeto (./copiloto.json)."""
+    alvo = CONFIG_HARNESS_GLOBAL if global_ else CONFIG_PROJETO
     dados = {}
     if alvo.exists():
         try:
@@ -2682,7 +2684,12 @@ def _menu_modelos() -> None:
         if modelo is None:
             continue
         modelo = modelo.split()[0]  # tira anotacoes tipo "(o copilot escolhe)"
-        alvo, dados = _ler_config_alvo()
+        escopo = _escolher("Salvar onde?", [
+            "padrao geral — vale para todos os projetos (recomendado)",
+            "so para este projeto (copiloto.json daqui)",
+        ]) or "padrao geral"
+        global_ = escopo.startswith("padrao")
+        alvo, dados = _ler_config_alvo(global_)
         _definir_modelo(dados, nome_papel, modelo)
         custo = _perguntar("custo estimado por chamada (para o portao)",
                            format(dados["papeis"][nome_papel].get("custo", 10), "g"))
@@ -2692,7 +2699,18 @@ def _menu_modelos() -> None:
             pass
         alvo.parent.mkdir(parents=True, exist_ok=True)
         alvo.write_text(json.dumps(dados, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        print(f"  salvo em {alvo}: {nome_papel} -> {modelo}")
+        print(f"  salvo (fica permanente) em {alvo}: {nome_papel} -> {modelo}")
+        # Modelos do projeto sobrepoem o padrao geral; se a escolha foi geral e
+        # este projeto tem modelos proprios, avisa e oferece limpar.
+        if global_ and CONFIG_PROJETO.exists():
+            bruta = _carregar_config_projeto_bruta()
+            if "papeis" in bruta:
+                print("  atencao: este projeto tem modelos proprios em copiloto.json, "
+                      "que sobrepoem o padrao geral.")
+                if _sim("remover os modelos do projeto para valer o padrao geral?"):
+                    bruta.pop("papeis", None)
+                    _salvar_config_projeto(bruta)
+                    print("  removido — o padrao geral vale aqui tambem")
 
 
 def _menu_tarefa() -> None:
