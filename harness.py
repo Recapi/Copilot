@@ -228,6 +228,13 @@ def chamar(cfg: dict, papel: str, prompt: str, forcar: bool, nota: str) -> str:
 
     usage_file = None
     via_argv = any("{prompt}" in parte for parte in conf["cmd"])
+    if not via_argv and any(parte in ("-p", "--prompt") for parte in conf["cmd"]):
+        # -p sem {prompt} engoliria a flag seguinte como se fosse o prompt —
+        # e a chamada errada seria paga. Melhor parar aqui.
+        print(f"erro: o cmd do papel '{papel}' tem -p/--prompt sem o placeholder "
+              "{prompt}. Ou remova o -p (prompt vai por stdin) ou use '-p', "
+              "'{prompt}' juntos.", file=sys.stderr)
+        sys.exit(2)
     cmd = []
     for parte in conf["cmd"]:
         if "{usage_file}" in parte:
