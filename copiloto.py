@@ -63,7 +63,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-VERSAO = "2026.08.29.5"
+VERSAO = "2026.08.29.6"
 REPO_ATUALIZACAO = os.environ.get("COPILOTO_REPO", "Recapi/Copilot")
 
 # --------------------------------------------------------------------------- #
@@ -896,6 +896,499 @@ def cmd_mapa(args) -> int:
 
 
 # =========================================================================== #
+# PROJETO — repos do trabalho (git/branch/pasta de fonte e config)
+# =========================================================================== #
+
+def _rodar_git(argumentos: list[str]) -> tuple[bool, str]:
+    try:
+        r = subprocess.run(["git"] + argumentos, capture_output=True, text=True, timeout=600)
+    except FileNotFoundError:
+        return False, "git nao esta instalado/no PATH"
+    except subprocess.TimeoutExpired:
+        return False, "git demorou demais"
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def sincronizar_repo_git(nome: str, info: dict) -> bool:
+    """Clona (se a pasta nao existe) ou atualiza (fetch/checkout/pull) um repo."""
+    pasta = Path(info["pasta"]).expanduser()
+    branch = info.get("branch") or "main"
+    if (pasta / ".git").exists():
+        print(f"  {nome}: atualizando {pasta} (branch {branch})")
+        passos = [["-C", str(pasta), "fetch", "--all", "--prune"],
+                  ["-C", str(pasta), "checkout", branch],
+                  ["-C", str(pasta), "pull", "--ff-only", "origin", branch]]
+        for args in passos:
+            ok, saida = _rodar_git(args)
+            if not ok:
+                print(f"  {nome}: git {' '.join(args[2:])} falhou: {saida[:300]}", file=sys.stderr)
+                return False
+        print(f"  {nome}: ok")
+        return True
+    print(f"  {nome}: clonando {info['url']} (branch {branch}) em {pasta}")
+    ok, saida = _rodar_git(["clone", "--branch", branch, info["url"], str(pasta)])
+    if not ok:
+        print(f"  {nome}: clone falhou: {saida[:300]}", file=sys.stderr)
+        return False
+    print(f"  {nome}: ok")
+    return True
+
+
+def _salvar_config_projeto(dados: dict) -> None:
+    CONFIG_PROJETO.write_text(json.dumps(dados, indent=2, ensure_ascii=False) + "\n",
+                              encoding="utf-8")
+
+
+def _carregar_config_projeto_bruta() -> dict:
+    if CONFIG_PROJETO.exists():
+        try:
+            return json.loads(CONFIG_PROJETO.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def cmd_projeto_baixar(args) -> int:
+    cfg = carregar_harness()
+    repos_git = cfg.get("repos_git") or {}
+    if not repos_git:
+        print("nenhum repo configurado. Rode o copiloto sem argumentos e use o menu "
+              "'Projeto do trabalho' para informar git/branch/pasta de fonte e config.",
+              file=sys.stderr)
+        return 1
+    falhas = 0
+    for nome, info in repos_git.items():
+        if not sincronizar_repo_git(nome, info):
+            falhas += 1
+    return 1 if falhas else 0
+
+
+# =========================================================================== #
+# ARQUITETURA — analisa varios repos e gera o MD do padrao do trabalho
+# =========================================================================== #
+
+EXT_CONFIG = {".yml", ".yaml", ".json", ".toml", ".ini", ".properties", ".conf", ".cfg", ".env"}
+
+
+def _chaves_config(caminho: Path) -> list[str]:
+    """Chaves/sessoes de topo de um arquivo de configuracao (melhor esforco)."""
+    try:
+        texto = caminho.read_text(encoding="utf-8", errors="ignore")[:200_000]
+    except OSError:
+        return []
+    ext = caminho.suffix.lower()
+    try:
+        if ext == ".json":
+            obj = json.loads(texto)
+            return list(obj)[:12] if isinstance(obj, dict) else []
+        if ext == ".toml":
+            try:
+                import tomllib
+                return list(tomllib.loads(texto))[:12]
+            except Exception:
+                ext = ".ini"  # cai no parser de secoes
+        if ext in (".yml", ".yaml"):
+            return re.findall(r"^([A-Za-z_][\w.-]*):", texto, re.M)[:12]
+        if ext in (".ini", ".conf", ".cfg", ".toml"):
+            return re.findall(r"^\[([^\]]+)\]", texto, re.M)[:12]
+        if ext in (".properties", ".env"):
+            return re.findall(r"^\s*([A-Za-z_][\w.]*)\s*=", texto, re.M)[:12]
+    except Exception:
+        return []
+    return []
+
+
+def _estilo_nome(stem: str) -> str:
+    if "-" in stem:
+        return "kebab-case"
+    if "_" in stem:
+        return "snake_case"
+    if stem[:1].isupper():
+        return "PascalCase"
+    if any(c.isupper() for c in stem[1:]):
+        return "camelCase"
+    return "minusculo"
+
+
+def _dependencias_declaradas(raiz: Path) -> list[str]:
+    deps: list[str] = []
+    pkg = raiz / "package.json"
+    if pkg.exists():
+        try:
+            dados = json.loads(pkg.read_text(encoding="utf-8"))
+            deps += list(dados.get("dependencies", {})) + list(dados.get("devDependencies", {}))
+        except (json.JSONDecodeError, OSError):
+            pass
+    py = raiz / "pyproject.toml"
+    if py.exists():
+        try:
+            import tomllib
+            dados = tomllib.loads(py.read_text(encoding="utf-8"))
+            for d in dados.get("project", {}).get("dependencies", []):
+                deps.append(re.split(r"[ =<>\[~!;]", d)[0])
+        except Exception:
+            pass
+    for req in raiz.glob("requirements*.txt"):
+        try:
+            for linha in req.read_text(encoding="utf-8", errors="ignore").splitlines():
+                linha = linha.strip()
+                if linha and not linha.startswith(("#", "-")):
+                    deps.append(re.split(r"[ =<>\[~!;]", linha)[0])
+        except OSError:
+            pass
+    gomod = raiz / "go.mod"
+    if gomod.exists():
+        try:
+            deps += re.findall(r"^\s+([\w./-]+)\s+v", gomod.read_text(encoding="utf-8"), re.M)
+        except OSError:
+            pass
+    pom = raiz / "pom.xml"
+    if pom.exists():
+        try:
+            deps += re.findall(r"<artifactId>([^<]+)</artifactId>",
+                               pom.read_text(encoding="utf-8", errors="ignore"))[1:16]
+        except OSError:
+            pass
+    return sorted(set(d for d in deps if d))
+
+
+def _scripts_do_repo(raiz: Path) -> list[str]:
+    scripts: list[str] = []
+    pkg = raiz / "package.json"
+    if pkg.exists():
+        try:
+            scripts += [f"npm run {s}" for s in json.loads(pkg.read_text(encoding="utf-8")).get("scripts", {})]
+        except (json.JSONDecodeError, OSError):
+            pass
+    mk = raiz / "Makefile"
+    if mk.exists():
+        try:
+            alvos = re.findall(r"^([A-Za-z0-9_.-]+):(?!=)", mk.read_text(encoding="utf-8", errors="ignore"), re.M)
+            scripts += [f"make {a}" for a in alvos if not a.startswith(".")][:12]
+        except OSError:
+            pass
+    return scripts[:20]
+
+
+def analisar_repo(raiz: Path) -> dict:
+    arquivos = [a for a in listar_arquivos(raiz)
+                if not IGNORAR_ARQ.search(a.name)
+                and not any(p in IGNORAR_DIRS for p in a.parts)]
+    linguagens: Counter[str] = Counter()
+    pastas: Counter[str] = Counter()
+    estilos: Counter[str] = Counter()
+    configs: list[tuple[str, list[str]]] = []
+    notaveis: list[str] = []
+    for a in arquivos:
+        rel = a.relative_to(raiz)
+        ext = a.suffix.lower()
+        if ext in LINGUAGENS:
+            linguagens[LINGUAGENS[ext][0]] += 1
+            estilos[_estilo_nome(a.stem)] += 1
+        topo = rel.parts[0] if len(rel.parts) > 1 else "(raiz)"
+        pastas[topo] += 1
+        if ext in EXT_CONFIG and len(rel.parts) <= 3 and a.stat().st_size < 300_000:
+            chaves = _chaves_config(a)
+            if chaves:
+                configs.append((rel.as_posix(), chaves))
+        if rel.as_posix().lower() in NOTAVEIS or a.name.lower() in NOTAVEIS:
+            notaveis.append(rel.as_posix())
+    return {
+        "nome": raiz.name,
+        "total": len(arquivos),
+        "linguagens": linguagens,
+        "pastas": pastas,
+        "estilos": estilos,
+        "configs": configs[:25],
+        "notaveis": sorted(notaveis),
+        "deps": _dependencias_declaradas(raiz),
+        "scripts": _scripts_do_repo(raiz),
+    }
+
+
+def gerar_arquitetura(raizes: list[Path]) -> str:
+    analises = [analisar_repo(r) for r in raizes]
+    out: list[str] = []
+    w = out.append
+    w("# Arquitetura padrao do trabalho")
+    w("")
+    w("> Gerado localmente por `copiloto.py arquitetura` — custo zero de credito.")
+    w(f"> Repositorios analisados: {', '.join('`' + a['nome'] + '`' for a in analises)}")
+    w("")
+
+    # ---- padrao comum entre os repos ----
+    if len(analises) > 1:
+        w("## Padrao comum entre os repositorios")
+        w("")
+        contagem_pastas: Counter[str] = Counter()
+        for a in analises:
+            for pasta in a["pastas"]:
+                if pasta != "(raiz)":
+                    contagem_pastas[pasta] += 1
+        comuns = [p for p, n in contagem_pastas.items() if n >= 2]
+        if comuns:
+            w("- Pastas que se repetem: " + ", ".join(f"`{p}/`" for p in sorted(comuns)))
+        contagem_deps: Counter[str] = Counter()
+        for a in analises:
+            for d in a["deps"]:
+                contagem_deps[d] += 1
+        deps_comuns = [d for d, n in contagem_deps.items() if n >= 2]
+        if deps_comuns:
+            w("- Dependencias compartilhadas: " + ", ".join(f"`{d}`" for d in sorted(deps_comuns)[:15]))
+        estilos_totais: Counter[str] = Counter()
+        for a in analises:
+            estilos_totais.update(a["estilos"])
+        if estilos_totais:
+            dominante, n = estilos_totais.most_common(1)[0]
+            total = sum(estilos_totais.values())
+            w(f"- Convencao de nome de arquivo dominante: **{dominante}** "
+              f"({n}/{total} arquivos de codigo)")
+        w("")
+
+    # ---- cada repo ----
+    for a in analises:
+        w(f"## Repositorio `{a['nome']}`")
+        w("")
+        principais = ", ".join(f"{l} ({n})" for l, n in a["linguagens"].most_common(5)) or "(sem codigo reconhecido)"
+        w(f"- Linguagens: {principais}")
+        w(f"- Arquivos: {a['total']}")
+        if a["notaveis"]:
+            w("- Pontos de entrada/convencao: " + ", ".join(f"`{x}`" for x in a["notaveis"][:8]))
+        if a["deps"]:
+            w("- Dependencias declaradas: " + ", ".join(f"`{d}`" for d in a["deps"][:15])
+              + (" ..." if len(a["deps"]) > 15 else ""))
+        if a["scripts"]:
+            w("- Scripts/alvos: " + ", ".join(f"`{s}`" for s in a["scripts"][:10]))
+        w("")
+        w("Estrutura (pastas de topo, por quantidade de arquivos):")
+        w("")
+        for pasta, n in a["pastas"].most_common(12):
+            w(f"- `{pasta}/` — {n} arquivos" if pasta != "(raiz)" else f"- (raiz) — {n} arquivos")
+        if a["configs"]:
+            w("")
+            w("Arquivos de configuracao e suas chaves de topo:")
+            w("")
+            for rel, chaves in a["configs"]:
+                w(f"- `{rel}`: " + ", ".join(f"`{c}`" for c in chaves))
+        w("")
+    return "\n".join(out)
+
+
+def cmd_arquitetura(args) -> int:
+    cfg = carregar_harness()
+    raizes_arg = args.raizes or [i["pasta"] for i in (cfg.get("repos_git") or {}).values()] \
+        or cfg.get("repos") or ["."]
+    raizes = []
+    for r in raizes_arg:
+        p = Path(r).resolve()
+        if not p.is_dir():
+            print(f"erro: {p} nao e um diretorio", file=sys.stderr)
+            return 1
+        raizes.append(p)
+    texto = gerar_arquitetura(raizes)
+    if args.stdout:
+        print(texto)
+    else:
+        destino = Path(args.saida)
+        destino.write_text(texto, encoding="utf-8")
+        print(f"{destino} gerado: {len(texto)} chars, ~{int(len(texto)/3.7)} tokens de contexto")
+    return 0
+
+
+# =========================================================================== #
+# BANCO — extrai a estrutura de banco dos repos (SQL, models, prisma...)
+# =========================================================================== #
+
+_IGNORAR_COLUNA = re.compile(
+    r"^\s*(PRIMARY|FOREIGN|CONSTRAINT|UNIQUE|KEY|INDEX|CHECK|REFERENCES)\b", re.I)
+
+
+def _tabelas_de_sql(texto: str) -> list[dict]:
+    """CREATE TABLE ... ( colunas ) por regex + parenteses balanceados."""
+    tabelas = []
+    for m in re.finditer(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`\"\[]?([\w.]+)[`\"\]]?\s*\(",
+                         texto, re.I):
+        nome = m.group(1).split(".")[-1]
+        inicio = m.end()
+        nivel, fim = 1, inicio
+        while fim < len(texto) and nivel > 0:
+            if texto[fim] == "(":
+                nivel += 1
+            elif texto[fim] == ")":
+                nivel -= 1
+            fim += 1
+        corpo = texto[inicio:fim - 1]
+        colunas = []
+        for linha in re.split(r",(?![^()]*\))", corpo):
+            linha = linha.strip()
+            if not linha or _IGNORAR_COLUNA.match(linha):
+                continue
+            cm = re.match(r"[`\"\[]?(\w+)[`\"\]]?\s+([\w()\[\], ]+?)(?:\s+(?:NOT|NULL|DEFAULT|PRIMARY|UNIQUE|REFERENCES|CHECK|AUTO_INCREMENT|GENERATED).*)?$",
+                          linha, re.I)
+            if cm:
+                colunas.append((cm.group(1), cm.group(2).strip()))
+        if colunas:
+            tabelas.append({"tabela": nome, "colunas": colunas})
+    return tabelas
+
+
+def _tabelas_de_python(texto: str) -> list[dict]:
+    """Modelos Django (models.Model) e SQLAlchemy (Column/mapped_column)."""
+    tabelas = []
+    for m in re.finditer(r"^class\s+(\w+)\s*\(([^)]*)\):", texto, re.M):
+        classe, bases = m.group(1), m.group(2)
+        if not re.search(r"models\.Model|Base\b|db\.Model|DeclarativeBase", bases):
+            continue
+        bloco_ini = m.end()
+        prox = re.search(r"^class\s+\w+", texto[bloco_ini:], re.M)
+        bloco = texto[bloco_ini:bloco_ini + prox.start()] if prox else texto[bloco_ini:]
+        nome_m = re.search(r"__tablename__\s*=\s*['\"](\w+)['\"]", bloco)
+        nome = nome_m.group(1) if nome_m else classe
+        colunas = []
+        for cm in re.finditer(r"^\s{4}(\w+)\s*=\s*models\.(\w+)Field", bloco, re.M):
+            colunas.append((cm.group(1), cm.group(2)))
+        for cm in re.finditer(r"^\s{4}(\w+)(?:\s*:\s*[\w\[\]\. ]+)?\s*=\s*(?:db\.)?(?:Column|mapped_column)\(\s*([\w.]*)",
+                              bloco, re.M):
+            colunas.append((cm.group(1), cm.group(2) or "?"))
+        if colunas:
+            tabelas.append({"tabela": nome, "colunas": colunas})
+    return tabelas
+
+
+def _tabelas_de_prisma(texto: str) -> list[dict]:
+    tabelas = []
+    for m in re.finditer(r"^model\s+(\w+)\s*\{([^}]*)\}", texto, re.M | re.S):
+        colunas = []
+        for linha in m.group(2).splitlines():
+            cm = re.match(r"\s*(\w+)\s+([\w\[\]?]+)", linha)
+            if cm and not cm.group(1).startswith("@"):
+                colunas.append((cm.group(1), cm.group(2)))
+        if colunas:
+            tabelas.append({"tabela": m.group(1), "colunas": colunas})
+    return tabelas
+
+
+def _tabelas_de_java(texto: str) -> list[dict]:
+    if "@Entity" not in texto:
+        return []
+    tabelas = []
+    for m in re.finditer(r"@Entity[\s\S]{0,200}?class\s+(\w+)", texto):
+        nome_m = re.search(r'@Table\s*\(\s*name\s*=\s*"(\w+)"', texto[:m.end()][-300:])
+        nome = nome_m.group(1) if nome_m else m.group(1)
+        corpo = texto[m.end():]
+        prox = re.search(r"@Entity", corpo)
+        if prox:
+            corpo = corpo[:prox.start()]
+        colunas = [(cm.group(2), cm.group(1))
+                   for cm in re.finditer(r"private\s+([\w<>\[\]]+)\s+(\w+)\s*;", corpo)]
+        if colunas:
+            tabelas.append({"tabela": nome, "colunas": colunas})
+    return tabelas
+
+
+def extrair_banco(raiz: Path) -> list[dict]:
+    """Varre um repo atras de estruturas de banco. Retorna
+    [{origem, tabela, colunas: [(nome, tipo)]}]."""
+    resultados = []
+    for a in listar_arquivos(raiz):
+        if any(p in IGNORAR_DIRS for p in a.parts):
+            continue
+        ext = a.suffix.lower()
+        if ext not in (".sql", ".py", ".prisma", ".java"):
+            continue
+        try:
+            if a.stat().st_size > 1_500_000:
+                continue
+            texto = a.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if ext == ".sql":
+            achados = _tabelas_de_sql(texto)
+        elif ext == ".py":
+            achados = _tabelas_de_python(texto)
+        elif ext == ".prisma":
+            achados = _tabelas_de_prisma(texto)
+        else:
+            achados = _tabelas_de_java(texto)
+        rel = a.relative_to(raiz).as_posix()
+        for t in achados:
+            resultados.append({"origem": rel, **t})
+    return resultados
+
+
+def gerar_banco(raizes: list[Path]) -> str:
+    out: list[str] = []
+    w = out.append
+    w("# Estrutura de banco — padrao do trabalho")
+    w("")
+    w("> Extraido localmente por `copiloto.py banco` (SQL, models Django/SQLAlchemy,")
+    w("> Prisma, entidades JPA). Referencia para desenhar projetos futuros no mesmo padrao.")
+    w("")
+    todas: list[dict] = []
+    for raiz in raizes:
+        tabelas = extrair_banco(raiz)
+        todas += tabelas
+        w(f"## Repositorio `{raiz.name}` — {len(tabelas)} tabelas/modelos")
+        w("")
+        if not tabelas:
+            w("(nenhuma estrutura de banco encontrada)")
+            w("")
+            continue
+        por_origem: dict[str, list[dict]] = defaultdict(list)
+        for t in tabelas:
+            por_origem[t["origem"]].append(t)
+        for origem in sorted(por_origem):
+            w(f"### `{origem}`")
+            w("")
+            for t in por_origem[origem]:
+                w(f"**{t['tabela']}**")
+                w("")
+                w("| coluna | tipo |")
+                w("|---|---|")
+                for nome, tipo in t["colunas"][:40]:
+                    w(f"| {nome} | {tipo} |")
+                w("")
+    if todas:
+        w("## Padrao para projetos futuros")
+        w("")
+        estilos = Counter(_estilo_nome(t["tabela"]) for t in todas)
+        dominante, n = estilos.most_common(1)[0]
+        w(f"- Nome de tabela/modelo: **{dominante}** ({n}/{len(todas)})")
+        colunas_todas = Counter()
+        for t in todas:
+            for nome, _ in t["colunas"]:
+                colunas_todas[nome.lower()] += 1
+        recorrentes = [(c, q) for c, q in colunas_todas.most_common(12)
+                       if q >= max(2, len(todas) // 3)]
+        if recorrentes:
+            w("- Colunas que aparecem em quase toda tabela (inclua nos projetos novos): "
+              + ", ".join(f"`{c}` ({q}x)" for c, q in recorrentes))
+        w("")
+    return "\n".join(out)
+
+
+def cmd_banco(args) -> int:
+    cfg = carregar_harness()
+    raizes_arg = args.raizes or [i["pasta"] for i in (cfg.get("repos_git") or {}).values()] \
+        or cfg.get("repos") or ["."]
+    raizes = []
+    for r in raizes_arg:
+        p = Path(r).resolve()
+        if not p.is_dir():
+            print(f"erro: {p} nao e um diretorio", file=sys.stderr)
+            return 1
+        raizes.append(p)
+    texto = gerar_banco(raizes)
+    if args.stdout:
+        print(texto)
+    else:
+        destino = Path(args.saida)
+        destino.write_text(texto, encoding="utf-8")
+        print(f"{destino} gerado: {len(texto)} chars, ~{int(len(texto)/3.7)} tokens")
+    return 0
+
+
+# =========================================================================== #
 # HARNESS — planejador (forte) -> executor (barato) -> validador (forte)
 # =========================================================================== #
 
@@ -1351,9 +1844,16 @@ def ler_passos(caminho: Path = PLANO) -> list[dict]:
 def contexto_mapa() -> str:
     m = Path("MAPA.md")
     if m.exists():
-        return f"\n\n--- MAPA DO REPOSITORIO ---\n{m.read_text(encoding='utf-8')}\n"
-    return ("\n\n(Nao ha MAPA.md. Gere com `python3 copiloto.py mapa` antes, para nao "
-            "gastar credito explorando o repo.)\n")
+        texto = f"\n\n--- MAPA DO REPOSITORIO ---\n{m.read_text(encoding='utf-8')}\n"
+    else:
+        texto = ("\n\n(Nao ha MAPA.md. Gere com `python3 copiloto.py mapa` antes, para nao "
+                 "gastar credito explorando o repo.)\n")
+    extras = [n for n in ("ARQUITETURA.md", "BANCO.md") if Path(n).exists()]
+    if extras:
+        texto += ("(Existem tambem " + " e ".join(f"`{e}`" for e in extras)
+                  + " com o padrao do trabalho — leia se a tarefa envolver "
+                  "estrutura, convencoes ou banco.)\n")
+    return texto
 
 
 def _sha_plano() -> str:
@@ -2037,6 +2537,360 @@ def cmd_atualizar(args) -> int:
 
 
 # =========================================================================== #
+# MENU — interface interativa: rode sem argumentos e escolha pelos numeros.
+# Nada de decorar parametro; os subcomandos continuam existindo para scripts.
+# =========================================================================== #
+
+MODELOS_FORTES = ["claude-sonnet-4.6", "gpt-5.3-codex", "gemini-3.1-pro", "claude-opus-4.6"]
+MODELOS_BARATOS = ["gpt-5-mini", "claude-haiku-4.5", "auto (o copilot escolhe)"]
+
+
+def _ns(**kwargs) -> argparse.Namespace:
+    return argparse.Namespace(**kwargs)
+
+
+def _perguntar(msg: str, padrao: str | None = None) -> str:
+    sufixo = f" [{padrao}]" if padrao else ""
+    resposta = input(f"  {msg}{sufixo}: ").strip()
+    return resposta or (padrao or "")
+
+
+def _sim(msg: str) -> bool:
+    return input(f"  {msg} (s/N): ").strip().lower() in ("s", "sim", "y")
+
+
+def _escolher(titulo: str, opcoes: list[str], outro: bool = False) -> str | None:
+    """Mostra opcoes numeradas; devolve o texto escolhido, o digitado (se
+    'outro'), ou None para voltar."""
+    print(f"\n  {NEGRITO}{titulo}{FIM}")
+    for i, rotulo in enumerate(opcoes, 1):
+        print(f"    {i}. {rotulo}")
+    if outro:
+        print("    d. digitar outro")
+    print("    0. voltar")
+    while True:
+        r = input("  escolha: ").strip().lower()
+        if r in ("", "0"):
+            return None
+        if outro and r == "d":
+            digitado = _perguntar("digite o nome exato")
+            return digitado or None
+        if r.isdigit() and 1 <= int(r) <= len(opcoes):
+            return opcoes[int(r) - 1]
+        print("  opcao invalida, tente de novo")
+
+
+def _linha_status() -> None:
+    try:
+        s = calcular(carregar_config())
+    except Exception:
+        return
+    if s.hoje_eh_util:
+        print(f"  {CINZA}hoje: pode gastar {NEGRITO}{s.permitido_hoje:g}{FIM}{CINZA} "
+              f"(ja usou {s.gasto_hoje:g}) | restam {s.restante:g} no ciclo | "
+              f"{s.dias_uteis_restantes} dias uteis{FIM}")
+    else:
+        print(f"  {CINZA}hoje e {s.motivo_nao_util} (sem cota propria) | "
+              f"restam {s.restante:g} no ciclo{FIM}")
+
+
+def _menu_orcamento() -> None:
+    while True:
+        escolha = _escolher("Orcamento", [
+            "Status: quanto posso gastar hoje",
+            "Registrar um gasto",
+            "Plano dia a dia ate o fim do mes",
+            "Resumo do ciclo (por dia e por modelo)",
+            "Sincronizar com o consumo real do GitHub",
+            "Configurar cota / dia de reset / reserva",
+        ])
+        if escolha is None:
+            return
+        if escolha.startswith("Status"):
+            cmd_status(_ns(json=False, data=None))
+        elif escolha.startswith("Registrar"):
+            qtd = _perguntar("quanto gastou (numero)")
+            if not qtd:
+                continue
+            try:
+                float(qtd)
+            except ValueError:
+                print("  precisa ser um numero")
+                continue
+            modelo = _perguntar("qual modelo (Enter = nao sei)") or None
+            nota = _perguntar("nota (Enter = nenhuma)") or None
+            cmd_gasto(_ns(qtd=qtd, modelo=modelo, nota=nota, quieto=False, data=None))
+        elif escolha.startswith("Plano"):
+            cmd_orc_plano(_ns(data=None))
+        elif escolha.startswith("Resumo"):
+            cmd_resumo(_ns(data=None))
+        elif escolha.startswith("Sincronizar"):
+            cmd_sincronizar(_ns(login=None, data=None))
+        elif escolha.startswith("Configurar"):
+            atual = carregar_config()
+            cota = _perguntar("cota do mes", format(atual["cota_ciclo"], "g"))
+            dia = _perguntar("dia do mes em que a cota reseta", str(atual["dia_reset"]))
+            reserva_pct = _perguntar("reserva de seguranca (fracao)", str(atual["reserva_pct"]))
+            try:
+                cmd_orc_init(_ns(cota=float(cota), unidade=None,
+                                 dia_reset=int(dia), reserva=float(reserva_pct)))
+            except ValueError:
+                print("  valores invalidos, nada alterado")
+
+
+def _ler_config_alvo() -> tuple[Path, dict]:
+    """Onde salvar escolhas de modelo: no copiloto.json do projeto se existir,
+    senao no harness.json pessoal."""
+    alvo = CONFIG_PROJETO if CONFIG_PROJETO.exists() else CONFIG_HARNESS_GLOBAL
+    dados = {}
+    if alvo.exists():
+        try:
+            dados = json.loads(alvo.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            dados = {}
+    if "papeis" not in dados:
+        dados["papeis"] = json.loads(json.dumps(carregar_harness()["papeis"]))
+    return alvo, dados
+
+
+def _definir_modelo(dados: dict, papel: str, modelo: str) -> None:
+    cmd = dados["papeis"][papel]["cmd"]
+    if "--model" in cmd:
+        cmd[cmd.index("--model") + 1] = modelo
+    else:
+        dados["papeis"][papel]["cmd"] = cmd + ["--model", modelo]
+
+
+def _menu_modelos() -> None:
+    cfg = carregar_harness()
+    print("\n  Modelos atuais:")
+    for papel, conf in cfg["papeis"].items():
+        cmd = conf["cmd"]
+        modelo = cmd[cmd.index("--model") + 1] if "--model" in cmd else "(sem --model)"
+        print(f"    {papel:<12} {modelo}  (custo estimado por chamada: {conf.get('custo', 0):g})")
+    print(f"  {CINZA}a lista de nomes muda com o tempo — confirme com /model dentro do copilot{FIM}")
+    while True:
+        papel = _escolher("Trocar o modelo de qual papel?",
+                          ["planejador (forte: escreve o plano)",
+                           "validador (forte: revisa o diff)",
+                           "executor (barato: digita o codigo)"])
+        if papel is None:
+            return
+        nome_papel = papel.split()[0]
+        sugestoes = MODELOS_BARATOS if nome_papel == "executor" else MODELOS_FORTES
+        modelo = _escolher(f"Modelo para o {nome_papel}", sugestoes, outro=True)
+        if modelo is None:
+            continue
+        modelo = modelo.split()[0]  # tira anotacoes tipo "(o copilot escolhe)"
+        alvo, dados = _ler_config_alvo()
+        _definir_modelo(dados, nome_papel, modelo)
+        custo = _perguntar("custo estimado por chamada (para o portao)",
+                           format(dados["papeis"][nome_papel].get("custo", 10), "g"))
+        try:
+            dados["papeis"][nome_papel]["custo"] = float(custo)
+        except ValueError:
+            pass
+        alvo.parent.mkdir(parents=True, exist_ok=True)
+        alvo.write_text(json.dumps(dados, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"  salvo em {alvo}: {nome_papel} -> {modelo}")
+
+
+def _menu_tarefa() -> None:
+    while True:
+        escolha = _escolher("Tarefa com o harness", [
+            "Gerar/atualizar o MAPA.md (gratis, faca primeiro)",
+            "Criar copiloto.json do projeto (detecta testes/linter)",
+            "Planejar uma tarefa (modelo forte escreve plano.md)",
+            "Rodar o plano (barato executa, forte valida)",
+            "Rodar so um passo do plano",
+        ])
+        if escolha is None:
+            return
+        if escolha.startswith("Gerar"):
+            raizes = _perguntar("repos a mapear, separados por espaco", ".").split()
+            cmd_mapa(_ns(raizes=raizes, saida="MAPA.md", max_simbolos=12,
+                         max_arquivos_detalhe=200, stdout=False))
+        elif escolha.startswith("Criar"):
+            repos = _perguntar("repos do projeto, separados por espaco "
+                               "(ex.: ./fonte ./config)", ".").split()
+            cmd_harness_init(_ns(repo=repos, sobrescrever=_sim("sobrescrever se ja existir?")))
+        elif escolha.startswith("Planejar"):
+            tarefa = _perguntar("descreva a tarefa")
+            if not tarefa:
+                continue
+            try:
+                cmd_planejar(_ns(tarefa=tarefa, forcar=False))
+            except SemOrcamento as e:
+                print(f"  [ORCAMENTO] {e}")
+                if _sim("invadir a reserva e planejar mesmo assim?"):
+                    cmd_planejar(_ns(tarefa=tarefa, forcar=True))
+        elif escolha.startswith("Rodar o plano"):
+            forcar = _sim("se faltar saldo hoje, invadir a reserva?")
+            cmd_rodar(_ns(passo=None, forcar=forcar, refazer=False))
+        elif escolha.startswith("Rodar so"):
+            n = _perguntar("numero do passo")
+            if not n.isdigit():
+                print("  precisa ser um numero")
+                continue
+            refazer = _sim("refazer mesmo se ja estiver aprovado?")
+            forcar = _sim("se faltar saldo hoje, invadir a reserva?")
+            cmd_rodar(_ns(passo=int(n), forcar=forcar, refazer=refazer))
+
+
+def _menu_projeto() -> None:
+    while True:
+        cfg = carregar_harness()
+        repos_git = cfg.get("repos_git") or {}
+        if repos_git:
+            print("\n  Repos configurados:")
+            for nome, info in repos_git.items():
+                print(f"    {nome:<10} {info['url']}  (branch {info.get('branch', 'main')}"
+                      f" -> {info['pasta']})")
+        escolha = _escolher("Projeto do trabalho", [
+            "Adicionar/editar um repo (git, branch, pasta)",
+            "Baixar/atualizar todos (clone ou pull)",
+            "Remover um repo da configuracao",
+        ])
+        if escolha is None:
+            return
+        if escolha.startswith("Adicionar"):
+            nome = _perguntar("apelido do repo (ex.: fonte, config)", "fonte")
+            atual = repos_git.get(nome, {})
+            url = _perguntar("URL do git (origem)", atual.get("url", ""))
+            if not url:
+                print("  precisa da URL")
+                continue
+            branch = _perguntar("branch", atual.get("branch", "main"))
+            pasta = _perguntar("pasta de destino", atual.get("pasta", f"./{nome}"))
+            dados = _carregar_config_projeto_bruta()
+            dados.setdefault("repos_git", {})[nome] = {"url": url, "branch": branch, "pasta": pasta}
+            # a pasta entra na lista de repos do harness (diff/verificacoes/--add-dir)
+            repos = dados.get("repos") or [r for r in cfg.get("repos", []) if r != "."] or []
+            if pasta not in repos:
+                repos.append(pasta)
+            dados["repos"] = repos
+            dados["add_dirs"] = [r for r in repos if r != "."]
+            _salvar_config_projeto(dados)
+            print(f"  salvo em {CONFIG_PROJETO}")
+            if _sim("baixar/atualizar agora?"):
+                sincronizar_repo_git(nome, dados["repos_git"][nome])
+        elif escolha.startswith("Baixar"):
+            cmd_projeto_baixar(_ns())
+        elif escolha.startswith("Remover"):
+            if not repos_git:
+                print("  nada configurado")
+                continue
+            nome = _escolher("Remover qual?", list(repos_git))
+            if nome:
+                dados = _carregar_config_projeto_bruta()
+                info = (dados.get("repos_git") or {}).pop(nome, None)
+                if info and info.get("pasta") in dados.get("repos", []):
+                    dados["repos"].remove(info["pasta"])
+                    dados["add_dirs"] = [r for r in dados.get("repos", []) if r != "."]
+                _salvar_config_projeto(dados)
+                print(f"  {nome} removido da configuracao (a pasta local fica no lugar)")
+
+
+def _menu_analise() -> None:
+    cfg = carregar_harness()
+    padrao = [i["pasta"] for i in (cfg.get("repos_git") or {}).values()] \
+        or [r for r in cfg.get("repos", []) if r] or ["."]
+    while True:
+        escolha = _escolher("Analise dos repositorios (tudo gratis, local)", [
+            "MAPA.md — estrutura e simbolos (para o harness nao explorar pagando)",
+            "ARQUITETURA.md — padrao do trabalho (pastas, deps, configs, convencoes)",
+            "BANCO.md — estrutura de banco (SQL, models, prisma) p/ projetos futuros",
+            "Gerar os tres de uma vez",
+        ])
+        if escolha is None:
+            return
+        raizes = _perguntar("repos a analisar, separados por espaco", " ".join(padrao)).split()
+        if escolha.startswith("MAPA") or escolha.startswith("Gerar"):
+            cmd_mapa(_ns(raizes=raizes, saida="MAPA.md", max_simbolos=12,
+                         max_arquivos_detalhe=200, stdout=False))
+        if escolha.startswith("ARQUITETURA") or escolha.startswith("Gerar"):
+            cmd_arquitetura(_ns(raizes=raizes, saida="ARQUITETURA.md", stdout=False))
+        if escolha.startswith("BANCO") or escolha.startswith("Gerar"):
+            cmd_banco(_ns(raizes=raizes, saida="BANCO.md", stdout=False))
+
+
+def _menu_libs() -> None:
+    while True:
+        escolha = _escolher("Libs de economia", [
+            "Ver o que esta instalado",
+            "Instalar/atualizar todas",
+            "Instalar/atualizar uma especifica",
+        ])
+        if escolha is None:
+            return
+        if escolha.startswith("Ver"):
+            cmd_libs_status(_ns(todas=False, nomes=[]))
+        elif escolha.startswith("Instalar/atualizar todas"):
+            cmd_libs_instalar(_ns(nomes=[], todas=True, global_=False))
+        else:
+            lib = _escolher("Qual?", list(LIBS))
+            if lib:
+                cmd_libs_instalar(_ns(nomes=[lib], todas=False, global_=False))
+
+
+def menu_principal() -> int:
+    print(f"\n  {NEGRITO}copiloto {VERSAO}{FIM} — casca do Copilot CLI com orcamento")
+    while True:
+        print()
+        _linha_status()
+        escolha = _escolher("O que voce quer fazer?", [
+            "Orcamento (status, gasto, sincronizar...)",
+            "Projeto do trabalho (git, branch e pastas de fonte/config)",
+            "Analisar repos (MAPA, ARQUITETURA e BANCO .md — gratis)",
+            "Tarefa com o harness (planejar, rodar)",
+            "Pergunta avulsa ao copilot (modelo barato)",
+            "Sessao interativa do copilot",
+            "Escolher os modelos dos papeis",
+            "Libs de economia (rg, rtk, ast-grep...)",
+            "Instalar agentes/AGENTS.md num repositorio",
+            "Atualizar o copiloto (baixa do GitHub)",
+        ])
+        if escolha is None:
+            print("  ate mais!")
+            return 0
+        try:
+            if escolha.startswith("Orcamento"):
+                _menu_orcamento()
+            elif escolha.startswith("Projeto"):
+                _menu_projeto()
+            elif escolha.startswith("Analisar"):
+                _menu_analise()
+            elif escolha.startswith("Tarefa"):
+                _menu_tarefa()
+            elif escolha.startswith("Pergunta"):
+                pergunta = _perguntar("qual a pergunta/tarefa curta")
+                if not pergunta:
+                    continue
+                forte = _sim("usar o modelo forte? (padrao: barato)")
+                rc = cmd_pedir(_ns(prompt=pergunta, forte=forte, modelo=None,
+                                   custo=None, forcar=False))
+                if rc == 1 and _sim("invadir a reserva e mandar mesmo assim?"):
+                    cmd_pedir(_ns(prompt=pergunta, forte=forte, modelo=None,
+                                  custo=None, forcar=True))
+            elif escolha.startswith("Sessao"):
+                cmd_sessao(_ns(args=[]))
+            elif escolha.startswith("Escolher"):
+                _menu_modelos()
+            elif escolha.startswith("Libs"):
+                _menu_libs()
+            elif escolha.startswith("Instalar agentes"):
+                repo = _perguntar("caminho do repositorio", ".")
+                cmd_instalar(_ns(repo=repo, sobrescrever=False,
+                                 mcp=_sim("mostrar exemplo de memoria MCP?")))
+            elif escolha.startswith("Atualizar"):
+                cmd_atualizar(_ns())
+        except SemOrcamento as e:
+            print(f"  [ORCAMENTO] {e}")
+        except RuntimeError as e:
+            print(f"  erro: {e}", file=sys.stderr)
+
+
+# =========================================================================== #
 # CLI
 # =========================================================================== #
 
@@ -2106,7 +2960,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="instala no bin do usuario (PATH) em vez de so na sessao da casca")
     sp.set_defaults(func=cmd_libs_instalar)
 
-    # ---- mapa ----
+    # ---- menu ----
+    sp = sub.add_parser("menu", help="interface interativa (mesmo que rodar sem argumentos)")
+    sp.set_defaults(func=lambda a: menu_principal())
+
+    # ---- mapa / arquitetura / banco ----
     sp = sub.add_parser("mapa", help="gera MAPA.md local (aceita varios repos)")
     sp.add_argument("raizes", nargs="*", help="raizes dos repos (padrao: .)")
     sp.add_argument("-o", "--saida", default="MAPA.md")
@@ -2114,6 +2972,24 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--max-arquivos-detalhe", type=int, default=200)
     sp.add_argument("--stdout", action="store_true")
     sp.set_defaults(func=cmd_mapa)
+
+    sp = sub.add_parser("arquitetura", help="gera ARQUITETURA.md: padrao do trabalho entre os repos")
+    sp.add_argument("raizes", nargs="*", help="padrao: repos do copiloto.json")
+    sp.add_argument("-o", "--saida", default="ARQUITETURA.md")
+    sp.add_argument("--stdout", action="store_true")
+    sp.set_defaults(func=cmd_arquitetura)
+
+    sp = sub.add_parser("banco", help="gera BANCO.md: estrutura de banco p/ projetos futuros")
+    sp.add_argument("raizes", nargs="*", help="padrao: repos do copiloto.json")
+    sp.add_argument("-o", "--saida", default="BANCO.md")
+    sp.add_argument("--stdout", action="store_true")
+    sp.set_defaults(func=cmd_banco)
+
+    # ---- projeto ----
+    proj = sub.add_parser("projeto", help="repos do trabalho: baixar/atualizar do git")
+    psub = proj.add_subparsers(dest="proj_cmd")
+    sp = psub.add_parser("baixar", help="clona/atualiza os repos configurados (menu: Projeto)")
+    sp.set_defaults(func=cmd_projeto_baixar)
 
     # ---- instalar ----
     sp = sub.add_parser("instalar", help="grava custom agents (.agent.md) e AGENTS.md num repo")
@@ -2168,13 +3044,20 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
     if not getattr(args, "cmd", None):
-        p.print_help()
-        return 0
+        # Sem argumentos = interface interativa. Ninguem precisa decorar flag.
+        try:
+            return menu_principal()
+        except (KeyboardInterrupt, EOFError):
+            print("\n  ate mais!")
+            return 0
     if args.cmd == "orcamento" and not getattr(args, "orc_cmd", None):
         orc.print_help()
         return 0
     if args.cmd == "libs" and not getattr(args, "libs_cmd", None):
         libs.print_help()
+        return 0
+    if args.cmd == "projeto" and not getattr(args, "proj_cmd", None):
+        proj.print_help()
         return 0
     return args.func(args)
 
