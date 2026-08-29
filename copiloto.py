@@ -27,6 +27,14 @@ pasta que enxerga os dois e liste-os em "repos" no copiloto.json — o mapa, o
 diff do validador e as verificacoes cobrem todos; "add_dirs" repassa cada um
 ao copilot via --add-dir.
 
+Como CASCA do copilot do trabalho:
+  copiloto.py pedir "pergunta rapida"     prompt avulso passando pelo portao de
+                                          orcamento e registrando o consumo
+  copiloto.py sessao                      mostra o saldo do dia e abre o copilot
+                                          interativo (lembra de sincronizar ao sair)
+  copiloto.py atualizar                   baixa a versao mais nova deste arquivo
+                                          do GitHub (Recapi/Copilot) e se substitui
+
 Uso rapido:
   python3 copiloto.py orcamento init --cota 10000
   python3 copiloto.py orcamento status
@@ -53,6 +61,9 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
+
+VERSAO = "2026.08.29.2"
+REPO_ATUALIZACAO = os.environ.get("COPILOTO_REPO", "Recapi/Copilot")
 
 # --------------------------------------------------------------------------- #
 # Caminhos de estado
@@ -1634,6 +1645,127 @@ def cmd_instalar(args) -> int:
 
 
 # =========================================================================== #
+# CASCA — pedir (prompt avulso), sessao (interativo) e atualizar (auto-update)
+# =========================================================================== #
+
+def cmd_pedir(args) -> int:
+    """Prompt avulso para o copilot, passando pelo portao de orcamento.
+
+    Usa o papel 'executor' (modelo barato) por padrao; --forte usa o
+    planejador. O consumo real (ou a estimativa) e registrado no orcamento.
+    """
+    cfg = json.loads(json.dumps(carregar_harness()))
+    papel = "planejador" if args.forte else "executor"
+    conf = cfg["papeis"][papel]
+    if args.modelo:
+        cmd = conf["cmd"]
+        if "--model" in cmd:
+            cmd[cmd.index("--model") + 1] = args.modelo
+        else:
+            conf["cmd"] = cmd + ["--model", args.modelo]
+    if args.custo is not None:
+        conf["custo"] = float(args.custo)
+    try:
+        saida = chamar(cfg, papel, args.prompt, args.forcar, args.prompt[:60])
+    except SemOrcamento as e:
+        print(f"[ORCAMENTO] {e}", file=sys.stderr)
+        return 1
+    if saida.strip():
+        print(saida)
+    return 0
+
+
+def cmd_sessao(args) -> int:
+    """Mostra o saldo do dia e abre o copilot interativo (casca fina).
+
+    O consumo de uma sessao interativa nao da para medir daqui — ao sair,
+    lembre de rodar 'orcamento sincronizar' (ou 'orcamento gasto N').
+    """
+    cfg_orc = carregar_config()
+    imprimir(calcular(cfg_orc), cfg_orc)
+    cfg = carregar_harness()
+    binario = cfg["papeis"]["executor"]["cmd"][0]
+    cmd = [binario]
+    for d in cfg.get("add_dirs", []):
+        cmd += ["--add-dir", d]
+    extras = list(args.args or [])
+    if extras and extras[0] == "--":
+        extras = extras[1:]
+    cmd += extras
+    print(f"{CINZA}$ {shlex.join(cmd)}{FIM}\n")
+    try:
+        codigo = subprocess.call(cmd)  # herda stdin/stdout: sessao interativa
+    except FileNotFoundError:
+        print(f"erro: '{binario}' nao encontrado no PATH. Instale o Copilot CLI "
+              "ou ajuste o cmd em copiloto.json.", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        codigo = 130
+    print(f"\n{CINZA}Sessao encerrada. O gasto interativo nao e medido daqui:{FIM}")
+    print(f"{CINZA}  python3 copiloto.py orcamento sincronizar   (via gh api){FIM}")
+    print(f"{CINZA}  python3 copiloto.py orcamento gasto N       (na mao, veja /usage){FIM}")
+    return codigo
+
+
+def _baixar_atualizacao() -> str:
+    """Baixa o copiloto.py mais novo do GitHub. Tenta HTTPS direto (urllib
+    respeita HTTPS_PROXY do ambiente) e cai para o gh CLI se falhar."""
+    url = f"https://raw.githubusercontent.com/{REPO_ATUALIZACAO}/main/copiloto.py"
+    try:
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=30) as resposta:
+            return resposta.read().decode("utf-8")
+    except Exception as e:  # inclui SSL de inspecao corporativa
+        erro_http = e
+    try:
+        return _gh(["api", f"repos/{REPO_ATUALIZACAO}/contents/copiloto.py",
+                    "-H", "Accept: application/vnd.github.raw+json"])
+    except RuntimeError as erro_gh:
+        raise RuntimeError(
+            f"download direto falhou ({type(erro_http).__name__}: {erro_http}) e o gh "
+            f"tambem ({erro_gh}). Atras de proxy/inspecao SSL, configure HTTPS_PROXY e "
+            f"SSL_CERT_FILE com a CA da empresa, ou use o gh autenticado.")
+
+
+def cmd_atualizar(args) -> int:
+    """Substitui este arquivo pela versao mais nova do GitHub, com backup."""
+    destino = Path(__file__).resolve()
+    atual = destino.read_text(encoding="utf-8")
+    print(f"versao instalada: {VERSAO}")
+    print(f"baixando de {REPO_ATUALIZACAO} (main)...")
+    try:
+        novo = _baixar_atualizacao()
+    except RuntimeError as e:
+        print(f"erro: {e}", file=sys.stderr)
+        return 1
+
+    # Sanidade antes de se sobrescrever: precisa parecer este programa e compilar.
+    if "def cmd_atualizar(" not in novo or "copiloto.py" not in novo[:2000]:
+        print("erro: o arquivo baixado nao parece ser o copiloto.py — abortando.", file=sys.stderr)
+        return 1
+    try:
+        compile(novo, "copiloto.py", "exec")
+    except SyntaxError as e:
+        print(f"erro: a versao baixada nao compila ({e}) — abortando.", file=sys.stderr)
+        return 1
+
+    m = re.search(r'^VERSAO = "([^"]+)"', novo, re.M)
+    versao_nova = m.group(1) if m else "(sem VERSAO)"
+    if novo == atual:
+        print(f"ja esta na versao mais recente ({VERSAO}).")
+        return 0
+
+    backup = destino.with_suffix(".py.bak")
+    backup.write_text(atual, encoding="utf-8")
+    tmp = destino.with_suffix(".py.novo")
+    tmp.write_text(novo, encoding="utf-8")
+    os.replace(tmp, destino)
+    print(f"atualizado: {VERSAO} -> {versao_nova}")
+    print(f"backup da versao anterior em {backup.name}")
+    return 0
+
+
+# =========================================================================== #
 # CLI
 # =========================================================================== #
 
@@ -1646,6 +1778,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="copiloto.py", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--versao", action="version", version=f"copiloto {VERSAO}")
     sub = p.add_subparsers(dest="cmd")
 
     def add_data(sp):
@@ -1672,6 +1805,23 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = sub.add_parser("custo", help="status do orcamento (atalho de 'orcamento status')")
     sp.set_defaults(func=cmd_custo)
+
+    # ---- casca ----
+    sp = sub.add_parser("pedir", help="prompt avulso pelo portao de orcamento (modelo barato)")
+    sp.add_argument("prompt")
+    sp.add_argument("--forte", action="store_true", help="usa o modelo do planejador")
+    sp.add_argument("--modelo", help="sobrescreve o modelo desta chamada")
+    sp.add_argument("--custo", type=float, help="sobrescreve a estimativa do portao")
+    sp.add_argument("--forcar", action="store_true")
+    sp.set_defaults(func=cmd_pedir)
+
+    sp = sub.add_parser("sessao", help="mostra o saldo do dia e abre o copilot interativo")
+    sp.add_argument("args", nargs=argparse.REMAINDER,
+                    help="argumentos extras repassados ao copilot (apos --)")
+    sp.set_defaults(func=cmd_sessao)
+
+    sp = sub.add_parser("atualizar", help=f"baixa a versao mais nova do GitHub ({REPO_ATUALIZACAO})")
+    sp.set_defaults(func=cmd_atualizar)
 
     # ---- mapa ----
     sp = sub.add_parser("mapa", help="gera MAPA.md local (aceita varios repos)")
