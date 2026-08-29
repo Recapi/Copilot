@@ -100,6 +100,35 @@ Onde as coisas ficam: o estado **pessoal** (cota, consumo) vai para
 (repos, verificações, modelos por papel) fica em `./copiloto.json`, criada pelo
 `init` e versionável no git do projeto.
 
+### O jeito mais fácil: o menu (sem decorar nada)
+
+```bash
+python3 copiloto.py        # sem argumentos = interface interativa
+```
+
+Abre um menu numerado em português com tudo: orçamento, projeto do trabalho
+(git/branch/pasta de fonte e config, com baixar/atualizar), análise dos repos,
+planejar/rodar, pergunta avulsa, **escolha de modelo por lista**, libs e
+atualização. Cada pergunta mostra o padrão entre colchetes — Enter aceita.
+Os subcomandos abaixo continuam existindo para scripts.
+
+### Análise dos repos (grátis, alimenta o planejador)
+
+No menu "Analisar repos", ou por comando:
+
+```bash
+python3 copiloto.py mapa            # MAPA.md — estrutura e símbolos
+python3 copiloto.py arquitetura     # ARQUITETURA.md — padrão do trabalho:
+                                    # pastas comuns, deps compartilhadas,
+                                    # convenção de nomes, chaves dos configs
+python3 copiloto.py banco           # BANCO.md — tabelas/colunas extraídas de
+                                    # .sql, models Django/SQLAlchemy, Prisma e
+                                    # JPA + o padrão p/ projetos futuros
+```
+
+Sem caminhos, os três usam os repos configurados no `copiloto.json`. Quando
+`ARQUITETURA.md`/`BANCO.md` existem, o planejador é avisado para consultá-los.
+
 ### Como casca do copilot do trabalho
 
 O `copiloto.py` é a porta de entrada; o `copilot` de verdade roda por baixo:
