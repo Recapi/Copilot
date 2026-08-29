@@ -42,22 +42,27 @@ PLANO = Path("plano.md")
 
 PADRAO = {
     "_comentario": (
-        "Ajuste 'cmd' de cada papel para o CLI que voce usa. {prompt} e substituido "
-        "pelo texto do prompt. 'custo' e quanto cada chamada consome da sua cota "
-        "(no Copilot, requisicao premium x multiplicador do modelo)."
+        "'cmd' de cada papel: {prompt} vira o texto do prompt e {usage_file} (opcional) "
+        "vira um JSON com o consumo real da chamada (--usage-output-file do Copilot CLI). "
+        "'custo' e a ESTIMATIVA em creditos usada pelo portao de orcamento ANTES de chamar; "
+        "se o usage_file trouxer o consumo real, e ele que e registrado. "
+        "Confira os nomes de modelos disponiveis com /model dentro do copilot."
     ),
     "papeis": {
         "planejador": {
-            "cmd": ["copilot", "-p", "{prompt}", "--model", "MODELO_FORTE", "--allow-all-tools"],
-            "custo": 1.0,
+            "cmd": ["copilot", "-p", "{prompt}", "--model", "claude-sonnet-4.6", "-s",
+                    "--usage-output-file", "{usage_file}"],
+            "custo": 40.0,
         },
         "executor": {
-            "cmd": ["copilot", "-p", "{prompt}", "--model", "MODELO_BARATO", "--allow-all-tools"],
-            "custo": 0.0,
+            "cmd": ["copilot", "-p", "{prompt}", "--model", "gpt-5-mini", "-s",
+                    "--allow-all-tools", "--usage-output-file", "{usage_file}"],
+            "custo": 10.0,
         },
         "validador": {
-            "cmd": ["copilot", "-p", "{prompt}", "--model", "MODELO_FORTE"],
-            "custo": 1.0,
+            "cmd": ["copilot", "-p", "{prompt}", "--model", "claude-sonnet-4.6", "-s",
+                    "--usage-output-file", "{usage_file}"],
+            "custo": 25.0,
         },
     },
     "verificacoes": [],
@@ -140,15 +145,60 @@ def cobrar(custo: float, modelo: str, nota: str) -> None:
 # Chamada ao agente
 # --------------------------------------------------------------------------- #
 
+def _creditos_do_usage(caminho: Path) -> float | None:
+    """Extrai o total de creditos do JSON de --usage-output-file.
+
+    O formato desse arquivo nao e documentado como estavel, entao a leitura e
+    defensiva: procura recursivamente qualquer campo numerico cujo nome
+    mencione 'credit'. Se nada for encontrado, cai na estimativa configurada.
+    """
+    try:
+        dados = json.loads(caminho.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    totais: list[float] = []   # campos com 'total' no nome
+    parciais: list[float] = []  # demais campos com 'credit' no nome
+
+    def varrer(obj):
+        if isinstance(obj, dict):
+            for chave, valor in obj.items():
+                if isinstance(valor, (int, float)) and "credit" in chave.lower():
+                    (totais if "total" in chave.lower() else parciais).append(float(valor))
+                else:
+                    varrer(valor)
+        elif isinstance(obj, list):
+            for item in obj:
+                varrer(item)
+
+    varrer(dados)
+    if totais:
+        return max(totais)
+    if parciais:
+        # Sem campo de total: o maior valor e o palpite mais seguro (um total
+        # sempre e >= cada parte; somar partes + total contaria em dobro).
+        return max(parciais)
+    return None
+
+
 def chamar(cfg: dict, papel: str, prompt: str, forcar: bool, nota: str) -> str:
     conf = cfg["papeis"][papel]
     custo = float(conf.get("custo", 0))
     portao(custo, f"{papel}: {nota}", forcar)
 
-    cmd = [parte.replace("{prompt}", prompt) for parte in conf["cmd"]]
+    usage_file = None
+    cmd = []
+    for parte in conf["cmd"]:
+        if "{usage_file}" in parte:
+            if usage_file is None:
+                fd, tmp = __import__("tempfile").mkstemp(prefix="harness-usage-", suffix=".json")
+                os.close(fd)
+                usage_file = Path(tmp)
+            parte = parte.replace("{usage_file}", str(usage_file))
+        cmd.append(parte.replace("{prompt}", prompt))
     modelo = next((cmd[i + 1] for i, p in enumerate(cmd) if p == "--model" and i + 1 < len(cmd)), papel)
 
-    print(f"\n>> {papel} ({modelo}, custo {custo:g}) — {nota}")
+    print(f"\n>> {papel} ({modelo}, estimado {custo:g}) — {nota}")
     if os.environ.get("HARNESS_DRY_RUN"):
         print(f"   [dry-run] {shlex.join(cmd)[:300]}")
         return "[dry-run] sem saida"
@@ -163,8 +213,16 @@ def chamar(cfg: dict, papel: str, prompt: str, forcar: bool, nota: str) -> str:
         cobrar(custo, modelo, f"{nota} (timeout)")
         raise RuntimeError(f"{papel} estourou o timeout")
 
-    # Cobra mesmo se falhou: a requisicao foi consumida do mesmo jeito.
-    cobrar(custo, modelo, nota)
+    # Registra o consumo REAL se o CLI informou; senao, a estimativa.
+    # Cobra mesmo em erro: a chamada foi consumida do mesmo jeito.
+    real = _creditos_do_usage(usage_file) if usage_file else None
+    if usage_file:
+        usage_file.unlink(missing_ok=True)
+    if real is not None and real > 0:
+        print(f"   consumo real: {real:g} creditos")
+        cobrar(real, modelo, nota)
+    else:
+        cobrar(custo, modelo, nota + " (estimado)")
     if r.returncode != 0:
         print(f"   (saiu com codigo {r.returncode})", file=sys.stderr)
         if r.stderr.strip():

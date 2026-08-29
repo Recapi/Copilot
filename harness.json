@@ -1,5 +1,5 @@
 {
-  "_comentario": "Ajuste 'cmd' de cada papel para o CLI que voce usa. {prompt} e substituido pelo texto do prompt. 'custo' e quanto cada chamada consome da sua cota (no Copilot, requisicao premium x multiplicador do modelo).",
+  "_comentario": "'cmd' de cada papel: {prompt} vira o texto do prompt e {usage_file} (opcional) vira um JSON com o consumo real da chamada (--usage-output-file do Copilot CLI). 'custo' e a ESTIMATIVA em creditos usada pelo portao de orcamento ANTES de chamar; se o usage_file trouxer o consumo real, e ele que e registrado. Confira os nomes de modelos disponiveis com /model dentro do copilot.",
   "papeis": {
     "planejador": {
       "cmd": [
@@ -7,10 +7,12 @@
         "-p",
         "{prompt}",
         "--model",
-        "MODELO_FORTE",
-        "--allow-all-tools"
+        "claude-sonnet-4.6",
+        "-s",
+        "--usage-output-file",
+        "{usage_file}"
       ],
-      "custo": 1.0
+      "custo": 40.0
     },
     "executor": {
       "cmd": [
@@ -18,10 +20,13 @@
         "-p",
         "{prompt}",
         "--model",
-        "MODELO_BARATO",
-        "--allow-all-tools"
+        "gpt-5-mini",
+        "-s",
+        "--allow-all-tools",
+        "--usage-output-file",
+        "{usage_file}"
       ],
-      "custo": 0.0
+      "custo": 10.0
     },
     "validador": {
       "cmd": [
@@ -29,9 +34,12 @@
         "-p",
         "{prompt}",
         "--model",
-        "MODELO_FORTE"
+        "claude-sonnet-4.6",
+        "-s",
+        "--usage-output-file",
+        "{usage_file}"
       ],
-      "custo": 1.0
+      "custo": 25.0
     }
   },
   "verificacoes": [],

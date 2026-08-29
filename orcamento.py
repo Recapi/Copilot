@@ -36,8 +36,8 @@ CONFIG_PATH = BASE / "config.json"
 USO_PATH = BASE / "uso.jsonl"
 
 PADRAO = {
-    "cota_ciclo": 300.0,
-    "unidade": "requisicoes premium",
+    "cota_ciclo": 10000.0,
+    "unidade": "creditos de IA",
     "dia_reset": 1,
     "reserva_pct": 0.15,
     "incluir_facultativos": True,
