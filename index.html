@@ -629,7 +629,7 @@
           <p class="card-note" id="modelTimestamp">—</p>
         </article>
         <article class="card">
-          <p class="card-label">Tipos de cota</p>
+          <p class="card-label">Cota acompanhada</p>
           <p class="card-value" id="quotaCount">0</p>
           <p class="card-note" id="quotaTimestamp">—</p>
         </article>
@@ -645,8 +645,8 @@
       <section class="section">
         <div class="section-head">
           <div>
-            <h2 class="section-title">Cotas atuais</h2>
-            <p class="section-note">Uso e saldo mais recentes informados pelo Copilot.</p>
+            <h2 class="section-title">Interações premium</h2>
+            <p class="section-note">Uso e saldo mais recentes de <code>premium_interactions</code>.</p>
           </div>
         </div>
         <div class="quota-grid" id="quotaGrid"></div>
@@ -798,7 +798,6 @@
                 <th>Data</th>
                 <th>Status</th>
                 <th>Modelos</th>
-                <th>Cotas</th>
                 <th>CLI</th>
                 <th>Erro</th>
               </tr>
@@ -821,6 +820,7 @@
     const SIDECAR_PATHS = ["copilot_dados.js", "dados_copilot/copilot_dados.js"];
     const REFRESH_MS = 60_000;
     const DAY_MS = 86_400_000;
+    const VISIBLE_QUOTA_TYPES = new Set(["premium_interactions"]);
     const CHART_COLORS = ["#58a6ff", "#3ddc97", "#bc8cff", "#f2cc60", "#ff6b7d", "#39d0d8"];
 
     const MODEL_COMPARE_FIELDS = {
@@ -1200,6 +1200,10 @@
       return String(value).toLowerCase() === "true" || String(value) === "1";
     }
 
+    function isVisibleQuota(row) {
+      return row.tipo_registro === "cota" && VISIBLE_QUOTA_TYPES.has(row.tipo_cota);
+    }
+
     function quotaSeries(rows, type) {
       return rows
         .filter((row) => row.tipo_registro === "cota" && row.tipo_cota === type)
@@ -1226,7 +1230,7 @@
     }
 
     function buildDailyRecords(rows) {
-      const types = [...new Set(rows.filter((row) => row.tipo_registro === "cota").map((row) => row.tipo_cota).filter(Boolean))];
+      const types = [...new Set(rows.filter(isVisibleQuota).map((row) => row.tipo_cota).filter(Boolean))];
       const records = [];
 
       types.forEach((type) => {
@@ -1268,9 +1272,10 @@
       const observedStart = Math.max(first.time.getTime(), cutoff7);
       const observedDays = Math.max(0, (latest.time.getTime() - observedStart) / DAY_MS);
       const usage7 = series.length > 1 ? rangeUsage(series, cutoff7) : 0;
-      const average = series.length > 1 && observedDays >= 1 / 24 ? usage7 / observedDays : null;
+      const average = series.length > 1 && observedDays >= 1 ? usage7 / observedDays : null;
       const daysRemaining = reset ? Math.max(0, (reset.getTime() - latest.time.getTime()) / DAY_MS) : null;
-      const safeDaily = remaining !== null && daysRemaining !== null && daysRemaining > 0 ? remaining / daysRemaining : null;
+      const calendarDaysRemaining = daysRemaining !== null && daysRemaining > 0 ? Math.max(1, Math.ceil(daysRemaining)) : null;
+      const safeDaily = remaining !== null && calendarDaysRemaining !== null ? remaining / calendarDaysRemaining : null;
       const projected = average !== null && daysRemaining !== null ? latest.used + average * daysRemaining : null;
       const projectedBalance = included !== null && projected !== null ? included - projected : null;
       const exhaustion = average !== null && average > 0 && remaining !== null
@@ -1281,7 +1286,7 @@
 
       return {
         type, series, latest, included, remaining, reset, unlimited, usage7, observedDays,
-        average, daysRemaining, safeDaily, projected, projectedBalance, exhaustion,
+        average, daysRemaining, calendarDaysRemaining, safeDaily, projected, projectedBalance, exhaustion,
         todayUsage: today ? today.consumed : 0
       };
     }
@@ -1309,9 +1314,11 @@
           const exhaustionText = analysis.exhaustion && analysis.reset && analysis.exhaustion < analysis.reset
             ? ` Esgotamento estimado em ${formatDay(analysis.exhaustion)}.`
             : "";
-          message = `${projectionText}${exhaustionText} Média baseada em ${formatNumber(analysis.observedDays, 1)} dia(s) observado(s), limitada aos últimos 7 dias.`;
+          message = `${projectionText}${exhaustionText} Para durar até a renovação: saldo ${formatNumber(analysis.remaining)} ÷ ${analysis.calendarDaysRemaining} dias = ${formatNumber(analysis.safeDaily)}/dia. Média observada nos últimos ${formatNumber(analysis.observedDays, 1)} dia(s), limitada a 7 dias.`;
         } else if (!analysis.reset) {
           message = "O Copilot não informou a data de renovação desta cota; a projeção de saldo não pode ser calculada.";
+        } else if (analysis.safeDaily !== null) {
+          message = `Para durar até ${formatDay(analysis.reset)}, o limite médio é ${formatNumber(analysis.remaining)} ÷ ${analysis.calendarDaysRemaining} dias = ${formatNumber(analysis.safeDaily)}/dia. A projeção de ritmo aparecerá depois de pelo menos 24 horas de histórico.`;
         }
 
         const projectedValue = analysis.projected === null
@@ -1330,9 +1337,9 @@
               <div class="metric"><span class="metric-label">Hoje</span><span class="metric-value">${formatNumber(analysis.todayUsage)}</span></div>
               <div class="metric"><span class="metric-label">Últimos 7 dias</span><span class="metric-value">${formatNumber(analysis.usage7)}</span></div>
               <div class="metric"><span class="metric-label">Média / dia</span><span class="metric-value">${analysis.average === null ? "—" : formatNumber(analysis.average)}</span></div>
-              <div class="metric"><span class="metric-label">Pode usar / dia</span><span class="metric-value">${analysis.safeDaily === null ? "—" : formatNumber(analysis.safeDaily)}</span></div>
+              <div class="metric"><span class="metric-label">Limite seguro / dia</span><span class="metric-value">${analysis.safeDaily === null ? "—" : formatNumber(analysis.safeDaily)}</span></div>
               <div class="metric"><span class="metric-label">Projeção no reinício</span><span class="metric-value">${escapeHtml(projectedValue)}</span></div>
-              <div class="metric"><span class="metric-label">Dias restantes</span><span class="metric-value">${analysis.daysRemaining === null ? "—" : formatNumber(analysis.daysRemaining, 1)}</span></div>
+              <div class="metric"><span class="metric-label">Dias de calendário</span><span class="metric-value">${analysis.calendarDaysRemaining === null ? "—" : formatNumber(analysis.calendarDaysRemaining, 0)}</span></div>
             </div>
             <p class="analysis-message">${escapeHtml(message)}</p>
           </article>`;
@@ -1509,7 +1516,7 @@
     }
 
     function renderChart(rows) {
-      const quotaRows = rows.filter((row) => row.tipo_registro === "cota");
+      const quotaRows = rows.filter(isVisibleQuota);
       const types = [...new Set(quotaRows.map((row) => row.tipo_cota).filter(Boolean))];
       const wrap = $("chartWrap");
       const legend = $("chartLegend");
@@ -1690,8 +1697,9 @@
     function renderChanges(rows) {
       const currentModels = snapshot(rows, "modelo", 0);
       const previousModels = snapshot(rows, "modelo", 1);
-      const currentQuotas = snapshot(rows, "cota", 0);
-      const previousQuotas = snapshot(rows, "cota", 1);
+      const visibleQuotaRows = rows.filter(isVisibleQuota);
+      const currentQuotas = snapshot(visibleQuotaRows, "cota", 0);
+      const previousQuotas = snapshot(visibleQuotaRows, "cota", 1);
       const changes = [];
 
       if (!previousModels.rows.length) {
@@ -1770,7 +1778,6 @@
           <td>${escapeHtml(formatDate(row.coleta_em))}</td>
           <td><span class="${escapeHtml(row.status || "")}">${escapeHtml(row.status || "—")}</span></td>
           <td>${escapeHtml(row.modelos || "—")}</td>
-          <td>${escapeHtml(row.cotas || "—")}</td>
           <td>${escapeHtml(row.versao_cli || "—")}</td>
           <td>${escapeHtml(row.erro || "—")}</td>
         </tr>`).join("");
@@ -1778,7 +1785,7 @@
 
     function render(rows) {
       const modelSnapshot = snapshot(rows, "modelo");
-      const quotaSnapshot = snapshot(rows, "cota");
+      const quotaSnapshot = snapshot(rows.filter(isVisibleQuota), "cota");
       state.latestModels = modelSnapshot.rows;
       state.latestQuotas = quotaSnapshot.rows;
       renderSummary(rows, modelSnapshot.rows, quotaSnapshot.rows, modelSnapshot.timestamp, quotaSnapshot.timestamp);
