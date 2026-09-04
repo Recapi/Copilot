@@ -28,11 +28,12 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
-VERSAO = "2.0.0"
+VERSAO = "2.1.0"
 MAX_RPC_BYTES = 50 * 1024 * 1024
 MUTEX_NAME = r"Local\CopilotUsoCsvPython"
 
@@ -657,6 +658,67 @@ class RpcClient:
         self.close()
 
 
+def list_models_for_cli_session(client):
+    """
+    Consulta a lista associada a uma sessao, equivalente conceitual do seletor
+    /models. Se o CLI for antigo, volta para o RPC global models.list.
+    """
+    session_id = "copilot-usage-{}".format(uuid.uuid4())
+    session_created = False
+    session_error = ""
+
+    try:
+        response = client.call(
+            "session.create",
+            {
+                "sessionId": session_id,
+                "clientName": "copilot-usage-csv-python",
+                "workingDirectory": str(Path.cwd()),
+                "tools": [],
+                "availableTools": [],
+                "excludedTools": [],
+                "requestPermission": False,
+                "requestUserInput": False,
+                "requestElicitation": False,
+                "hooks": False,
+                "streaming": False,
+                "enableConfigDiscovery": True,
+                "enableSessionStore": False,
+                "enableSkills": False,
+                "skipEmbeddingRetrieval": True,
+                "memory": {"enabled": False},
+            },
+        )
+        returned_id = get_value(response, "sessionId", session_id)
+        if returned_id:
+            session_id = str(returned_id)
+        session_created = True
+
+        session_result = client.call(
+            "session.model.list",
+            {"sessionId": session_id, "skipCache": True},
+        )
+        models = get_value(session_result, "list", None)
+        if models is None:
+            # Compatibilidade defensiva com runtimes que usam a chave models.
+            models = get_value(session_result, "models", None)
+        if not isinstance(models, list) or not models:
+            raise CollectorError("session.model.list nao retornou modelos")
+        quotas = get_value(session_result, "quotaSnapshots", None)
+        return models, quotas, "session.model.list", ""
+    except Exception as exc:
+        session_error = str(exc)
+        global_result = client.call("models.list", {"skipCache": True})
+        models = get_value(global_result, "models", [])
+        return models, None, "models.list (fallback)", session_error
+    finally:
+        if session_created:
+            try:
+                client.call("session.destroy", {"sessionId": session_id}, timeout=10)
+            except Exception:
+                pass
+
+
 def models_to_rows(models, collected_at):
     rows = []
     for model in models if isinstance(models, list) else []:
@@ -769,11 +831,14 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
     collected_at = agora_iso()
     status = "erro"
     errors = []
+    warnings = []
     model_rows = None
     quota_rows = None
     model_count = 0
     quota_count = 0
     version = ""
+    model_source = ""
+    session_quota_snapshots = None
 
     try:
         executable = resolve_copilot(requested_copilot)
@@ -792,10 +857,22 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
                 )
 
                 try:
-                    # A API nao e paginada. skipCache forca uma nova consulta ao
-                    # catalogo da conta e evita perder modelos recem-publicados.
-                    model_result = client.call("models.list", {"skipCache": True})
-                    models = get_value(model_result, "models", [])
+                    # A API nao e paginada. O seletor /models trabalha no
+                    # contexto de uma sessao, por isso ele pode diferir do RPC
+                    # global. A funcao usa session.model.list e so recorre ao
+                    # models.list global em runtimes antigos.
+                    (
+                        models,
+                        session_quota_snapshots,
+                        model_source,
+                        session_warning,
+                    ) = list_models_for_cli_session(client)
+                    if session_warning:
+                        warnings.append(
+                            "lista da sessao indisponivel; usado fallback global: {}".format(
+                                session_warning
+                            )
+                        )
                     model_rows = models_to_rows(models, collected_at)
                     if not model_rows:
                         model_rows = None
@@ -805,8 +882,10 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
                     errors.append("modelos: {}".format(exc))
 
                 try:
-                    quota_result = client.call("account.getQuota", {})
-                    snapshots = get_value(quota_result, "quotaSnapshots", None)
+                    snapshots = session_quota_snapshots
+                    if not isinstance(snapshots, dict) or not snapshots:
+                        quota_result = client.call("account.getQuota", {})
+                        snapshots = get_value(quota_result, "quotaSnapshots", None)
                     quota_rows = quota_to_rows(snapshots, collected_at)
                     if not quota_rows:
                         quota_rows = None
@@ -861,8 +940,12 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
             try:
                 append_log(
                     output_dir,
-                    "status={}; modelos={}; cotas={}; erro={}".format(
-                        status, model_count, quota_count, " | ".join(errors)
+                    "status={}; modelos={}; fonte={}; cotas={}; erro={}".format(
+                        status,
+                        model_count,
+                        model_source,
+                        quota_count,
+                        " | ".join(errors),
                     ),
                 )
             except OSError as exc:
@@ -885,6 +968,9 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
             )
         )
         print("CSV unico: {}".format(output_dir / "copilot_dados.csv"))
+        print("Fonte dos modelos: {}".format(model_source or "nao identificada"))
+        for warning in warnings:
+            print("Aviso: {}".format(warning))
         if errors:
             print("Aviso: {}".format(" | ".join(errors)))
     else:
@@ -934,7 +1020,7 @@ def run_loop(
     print("Coletor do GitHub Copilot iniciado (versao {}).".format(VERSAO))
     print("Intervalo: {} hora(s). Para parar, pressione Ctrl+C.".format(interval_hours))
     print("CSV unico: {}".format(output_dir / "copilot_dados.csv"))
-    print("Modelos: consulta completa sem cache; models.list nao usa paginacao.")
+    print("Modelos: lista da sessao sem cache; a API nao usa paginacao.")
     if os.name == "nt" and keep_awake_enabled:
         if awake:
             print("Windows: suspensao e desligamento automatico da tela inibidos.")
