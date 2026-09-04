@@ -12,7 +12,8 @@ Opcoes:
     python copilot_uso.py --saida C:\\caminho\\dados --intervalo-horas 3
 
 Requisitos: Python 3 e o comando `copilot` instalado e autenticado.
-Nao usa bibliotecas externas, PowerShell, arquivos .cmd ou Agendador de Tarefas.
+Nao usa bibliotecas externas, PowerShell, arquivo .cmd auxiliar ou Agendador de
+Tarefas. No Windows, mantem o computador acordado enquanto o loop esta aberto.
 """
 
 import argparse
@@ -31,7 +32,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
-VERSAO = "1.0.0"
+VERSAO = "2.0.0"
 MAX_RPC_BYTES = 50 * 1024 * 1024
 MUTEX_NAME = r"Local\CopilotUsoCsvPython"
 
@@ -94,13 +95,58 @@ EXECUTION_FIELDS = [
     "erro",
 ]
 
+# Um unico CSV historico. Cada linha informa em tipo_registro se representa
+# um modelo, uma cota ou o resultado geral da execucao.
+COPILOT_FIELDS = ["coleta_em", "tipo_registro"]
+for _field in MODEL_FIELDS + QUOTA_FIELDS + EXECUTION_FIELDS:
+    if _field not in COPILOT_FIELDS:
+        COPILOT_FIELDS.append(_field)
+
+MODEL_LABELS = {
+    "nome": "nome",
+    "estado_politica": "politica",
+    "categoria": "categoria",
+    "categoria_preco": "categoria de preco",
+    "multiplicador_request": "multiplicador",
+    "desconto_percentual": "desconto",
+    "lote_tokens": "lote de tokens",
+    "entrada_creditos_por_lote": "preco de entrada",
+    "cache_leitura_creditos_por_lote": "preco de cache/leitura",
+    "cache_escrita_creditos_por_lote": "preco de cache/escrita",
+    "cache_escrita_1h_creditos_por_lote": "preco de cache/escrita 1h",
+    "saida_creditos_por_lote": "preco de saida",
+    "max_entrada_tokens": "limite de entrada",
+    "max_saida_tokens": "limite de saida",
+    "max_contexto_tokens": "janela de contexto",
+    "suporta_visao": "visao",
+    "suporta_esforco_raciocinio": "esforco de raciocinio",
+    "esforcos_raciocinio": "niveis de raciocinio",
+    "esforco_padrao": "raciocinio padrao",
+    "contexto_longo_entrada_creditos": "entrada/contexto longo",
+    "contexto_longo_saida_creditos": "saida/contexto longo",
+    "promocao_desconto_percentual": "promocao",
+    "promocao_termina_em": "fim da promocao",
+}
+
+QUOTA_LABELS = {
+    "incluido": "incluido",
+    "usado": "usado",
+    "restante_calculado": "restante",
+    "restante_percentual": "restante %",
+    "excedente": "excedente",
+    "ilimitado": "ilimitado",
+    "uso_apos_esgotar_permitido": "uso apos esgotar",
+    "excedente_apos_esgotar_permitido": "excedente apos esgotar",
+    "reinicia_em": "reinicio",
+}
+
 
 class CollectorError(RuntimeError):
     pass
 
 
 def agora_iso():
-    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    return dt.datetime.now().astimezone().isoformat(timespec="microseconds")
 
 
 def get_value(obj, name, default=""):
@@ -147,17 +193,6 @@ def normalize_row(row, fields):
     return {field: csv_cell(row.get(field, "")) for field in fields}
 
 
-def write_current_csv(path, rows, fields):
-    if not rows:
-        return
-    temporary = Path(str(path) + ".tmp")
-    with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, delimiter=";", lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(normalize_row(row, fields) for row in rows)
-    os.replace(str(temporary), str(path))
-
-
 def append_history_csv(path, rows, fields):
     if not rows:
         return
@@ -168,6 +203,175 @@ def append_history_csv(path, rows, fields):
         if not exists:
             writer.writeheader()
         writer.writerows(normalize_row(row, fields) for row in rows)
+
+
+def rows_by_key(rows, key_field, fields):
+    result = {}
+    for row in rows:
+        normalized = normalize_row(row, fields)
+        key = str(normalized.get(key_field, ""))
+        if key:
+            result[key] = normalized
+    return result
+
+
+def read_last_snapshot(csv_path):
+    """Le a ultima fotografia valida de modelos e cotas do CSV unificado."""
+    models = {}
+    quotas = {}
+    model_timestamp = None
+    quota_timestamp = None
+
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return None, None
+
+    try:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle, delimiter=";"):
+                record_type = row.get("tipo_registro", "")
+                timestamp = row.get("coleta_em", "")
+                if record_type == "modelo" and row.get("modelo_id"):
+                    if timestamp != model_timestamp:
+                        models = {}
+                        model_timestamp = timestamp
+                    models[row["modelo_id"]] = row
+                elif record_type == "cota" and row.get("tipo_cota"):
+                    if timestamp != quota_timestamp:
+                        quotas = {}
+                        quota_timestamp = timestamp
+                    quotas[row["tipo_cota"]] = row
+    except (OSError, csv.Error):
+        return None, None
+
+    return (models or None), (quotas or None)
+
+
+def read_legacy_snapshot(output_dir):
+    """Usa os CSVs da versao 1 somente como base para a primeira comparacao."""
+
+    def read_file(path, key_field):
+        if not path.exists() or path.stat().st_size == 0:
+            return None
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                result = {}
+                for row in csv.DictReader(handle, delimiter=";"):
+                    key = row.get(key_field, "")
+                    if key:
+                        result[key] = row
+                return result or None
+        except (OSError, csv.Error):
+            return None
+
+    return (
+        read_file(output_dir / "modelos_atuais.csv", "modelo_id"),
+        read_file(output_dir / "uso_atual.csv", "tipo_cota"),
+    )
+
+
+def load_previous_snapshot(output_dir):
+    models, quotas = read_last_snapshot(output_dir / "copilot_dados.csv")
+    if models is not None or quotas is not None:
+        return models, quotas
+    return read_legacy_snapshot(output_dir)
+
+
+def decimal_delta(old_value, new_value):
+    try:
+        old_number = Decimal(str(old_value).replace(",", "."))
+        new_number = Decimal(str(new_value).replace(",", "."))
+        delta = new_number - old_number
+        if delta == 0:
+            return ""
+        sign = "+" if delta > 0 else ""
+        return " ({}{})".format(sign, csv_cell(delta))
+    except (InvalidOperation, ValueError):
+        return ""
+
+
+def compact_model_description(row):
+    name = row.get("nome", "")
+    model_id = row.get("modelo_id", "")
+    label = "{} ({})".format(name, model_id) if name and name != model_id else model_id
+    details = []
+    if row.get("multiplicador_request", "") != "":
+        details.append("x{} request".format(row["multiplicador_request"]))
+    if row.get("entrada_creditos_por_lote", "") != "":
+        details.append("entrada {} creditos".format(row["entrada_creditos_por_lote"]))
+    if row.get("saida_creditos_por_lote", "") != "":
+        details.append("saida {} creditos".format(row["saida_creditos_por_lote"]))
+    return "{} [{}]".format(label, ", ".join(details)) if details else label
+
+
+def changed_fields(old_row, new_row, labels):
+    changes = []
+    for field, label in labels.items():
+        old_value = str(old_row.get(field, ""))
+        new_value = str(new_row.get(field, ""))
+        if old_value != new_value:
+            changes.append(
+                "{}: {} -> {}{}".format(
+                    label,
+                    old_value or "(vazio)",
+                    new_value or "(vazio)",
+                    decimal_delta(old_value, new_value),
+                )
+            )
+    return changes
+
+
+def show_changes(previous_models, current_models, previous_quotas, current_quotas):
+    print("\nAlteracoes desde a coleta anterior:")
+    any_change = False
+
+    if current_models is None:
+        print("  [!] Modelos nao comparados porque a consulta falhou.")
+    elif previous_models is None:
+        print("  [=] Base inicial de modelos criada: {} itens.".format(len(current_models)))
+    else:
+        old_keys = set(previous_models)
+        new_keys = set(current_models)
+        for key in sorted(new_keys - old_keys):
+            print("  [MODELO +] {}".format(compact_model_description(current_models[key])))
+            any_change = True
+        for key in sorted(old_keys - new_keys):
+            print("  [MODELO -] {}".format(compact_model_description(previous_models[key])))
+            any_change = True
+        for key in sorted(old_keys & new_keys):
+            changes = changed_fields(previous_models[key], current_models[key], MODEL_LABELS)
+            if changes:
+                shown = changes[:8]
+                suffix = "; +{} campo(s)".format(len(changes) - 8) if len(changes) > 8 else ""
+                print("  [MODELO ~] {}: {}{}".format(key, "; ".join(shown), suffix))
+                any_change = True
+
+    if current_quotas is None:
+        print("  [!] Cotas nao comparadas porque a consulta falhou.")
+    elif previous_quotas is None:
+        print("  [=] Base inicial de cotas criada: {} itens.".format(len(current_quotas)))
+    else:
+        old_keys = set(previous_quotas)
+        new_keys = set(current_quotas)
+        for key in sorted(new_keys - old_keys):
+            print("  [COTA +] {}".format(key))
+            any_change = True
+        for key in sorted(old_keys - new_keys):
+            print("  [COTA -] {}".format(key))
+            any_change = True
+        for key in sorted(old_keys & new_keys):
+            changes = changed_fields(previous_quotas[key], current_quotas[key], QUOTA_LABELS)
+            if changes:
+                print("  [COTA ~] {}: {}".format(key, "; ".join(changes)))
+                any_change = True
+
+    if (
+        not any_change
+        and previous_models is not None
+        and current_models is not None
+        and previous_quotas is not None
+        and current_quotas is not None
+    ):
+        print("  Nenhuma mudanca em modelos, precos ou cotas.")
 
 
 def append_log(output_dir, message):
@@ -561,9 +765,12 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
         print("Coleta ignorada: outra copia do programa ja esta executando.")
         return 0
 
+    previous_models, previous_quotas = load_previous_snapshot(output_dir)
     collected_at = agora_iso()
     status = "erro"
     errors = []
+    model_rows = None
+    quota_rows = None
     model_count = 0
     quota_count = 0
     version = ""
@@ -585,15 +792,14 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
                 )
 
                 try:
-                    model_result = client.call("models.list", {})
+                    # A API nao e paginada. skipCache forca uma nova consulta ao
+                    # catalogo da conta e evita perder modelos recem-publicados.
+                    model_result = client.call("models.list", {"skipCache": True})
                     models = get_value(model_result, "models", [])
                     model_rows = models_to_rows(models, collected_at)
                     if not model_rows:
+                        model_rows = None
                         raise CollectorError("o runtime nao retornou modelos")
-                    write_current_csv(output_dir / "modelos_atuais.csv", model_rows, MODEL_FIELDS)
-                    append_history_csv(
-                        output_dir / "modelos_historico.csv", model_rows, MODEL_FIELDS
-                    )
                     model_count = len(model_rows)
                 except Exception as exc:
                     errors.append("modelos: {}".format(exc))
@@ -603,11 +809,8 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
                     snapshots = get_value(quota_result, "quotaSnapshots", None)
                     quota_rows = quota_to_rows(snapshots, collected_at)
                     if not quota_rows:
+                        quota_rows = None
                         raise CollectorError("o runtime nao retornou cotas para esta conta")
-                    write_current_csv(output_dir / "uso_atual.csv", quota_rows, QUOTA_FIELDS)
-                    append_history_csv(
-                        output_dir / "uso_historico.csv", quota_rows, QUOTA_FIELDS
-                    )
                     quota_count = len(quota_rows)
                 except Exception as exc:
                     errors.append("uso: {}".format(exc))
@@ -629,56 +832,127 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
         status = "erro"
     finally:
         error_text = " | ".join(dict.fromkeys(errors))
-        execution_row = {
-            "coleta_em": collected_at,
-            "status": status,
-            "modelos": model_count,
-            "cotas": quota_count,
-            "versao_cli": version,
-            "erro": error_text,
-        }
+        unified_rows = []
+        if model_rows:
+            unified_rows.extend(
+                dict(row, tipo_registro="modelo") for row in model_rows
+            )
+        if quota_rows:
+            unified_rows.extend(dict(row, tipo_registro="cota") for row in quota_rows)
+        unified_rows.append(
+            {
+                "coleta_em": collected_at,
+                "tipo_registro": "execucao",
+                "status": status,
+                "modelos": model_count,
+                "cotas": quota_count,
+                "versao_cli": version,
+                "erro": error_text,
+            }
+        )
         try:
-            append_history_csv(
-                output_dir / "execucoes.csv", [execution_row], EXECUTION_FIELDS
-            )
-            append_log(
-                output_dir,
-                "status={}; modelos={}; cotas={}; erro={}".format(
-                    status, model_count, quota_count, error_text
-                ),
-            )
+            try:
+                append_history_csv(
+                    output_dir / "copilot_dados.csv", unified_rows, COPILOT_FIELDS
+                )
+            except OSError as exc:
+                errors.append("CSV: {}".format(exc))
+                status = "erro"
+            try:
+                append_log(
+                    output_dir,
+                    "status={}; modelos={}; cotas={}; erro={}".format(
+                        status, model_count, quota_count, " | ".join(errors)
+                    ),
+                )
+            except OSError as exc:
+                errors.append("log: {}".format(exc))
+                status = "erro"
         finally:
             single_instance.release()
 
+    current_models = (
+        rows_by_key(model_rows, "modelo_id", MODEL_FIELDS) if model_rows else None
+    )
+    current_quotas = (
+        rows_by_key(quota_rows, "tipo_cota", QUOTA_FIELDS) if quota_rows else None
+    )
+
     if status in ("ok", "parcial"):
         print(
-            "{} Coleta {}: {} modelos e {} cotas. CSV em: {}".format(
-                collected_at, status, model_count, quota_count, output_dir
+            "\n{} Coleta {}: {} modelos e {} cotas.".format(
+                collected_at, status, model_count, quota_count
             )
         )
+        print("CSV unico: {}".format(output_dir / "copilot_dados.csv"))
         if errors:
             print("Aviso: {}".format(" | ".join(errors)))
-        return 0
+    else:
+        print("\n{} Coleta falhou: {}".format(collected_at, " | ".join(errors)))
+        print("Consulte: {}".format(output_dir / "coletor.log"))
 
-    print("{} Coleta falhou: {}".format(collected_at, " | ".join(errors)))
-    print("Consulte: {}".format(output_dir / "coletor.log"))
-    return 1
+    show_changes(previous_models, current_models, previous_quotas, current_quotas)
+    return 0 if status in ("ok", "parcial") else 1
 
 
-def run_loop(output_dir, requested_copilot, timeout_seconds, interval_hours):
+class KeepWindowsAwake:
+    """Inibe suspensao e desligamento automatico da tela durante o loop."""
+
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ES_DISPLAY_REQUIRED = 0x00000002
+
+    def __init__(self, enabled):
+        self.enabled = enabled and os.name == "nt"
+        self.active = False
+
+    def start(self):
+        if not self.enabled:
+            return False
+        flags = self.ES_CONTINUOUS | self.ES_SYSTEM_REQUIRED | self.ES_DISPLAY_REQUIRED
+        result = ctypes.windll.kernel32.SetThreadExecutionState(flags)
+        self.active = bool(result)
+        return self.active
+
+    def stop(self):
+        if self.active:
+            ctypes.windll.kernel32.SetThreadExecutionState(self.ES_CONTINUOUS)
+            self.active = False
+
+
+def run_loop(
+    output_dir,
+    requested_copilot,
+    timeout_seconds,
+    interval_hours,
+    keep_awake_enabled,
+):
     interval_seconds = interval_hours * 60 * 60
-    print("Coletor do GitHub Copilot iniciado.")
-    print("Intervalo: {} hora(s). Para parar, pressione Ctrl+C.".format(interval_hours))
-    print("CSV: {}".format(output_dir))
+    keep_awake = KeepWindowsAwake(keep_awake_enabled)
+    awake = keep_awake.start()
 
-    while True:
-        cycle_started = time.monotonic()
-        collect_once(output_dir, requested_copilot, timeout_seconds)
-        elapsed = time.monotonic() - cycle_started
-        wait_seconds = max(0, interval_seconds - elapsed)
-        next_run = dt.datetime.now().astimezone() + dt.timedelta(seconds=wait_seconds)
-        print("Proxima coleta: {}".format(next_run.strftime("%d/%m/%Y %H:%M:%S %z")))
-        time.sleep(wait_seconds)
+    print("Coletor do GitHub Copilot iniciado (versao {}).".format(VERSAO))
+    print("Intervalo: {} hora(s). Para parar, pressione Ctrl+C.".format(interval_hours))
+    print("CSV unico: {}".format(output_dir / "copilot_dados.csv"))
+    print("Modelos: consulta completa sem cache; models.list nao usa paginacao.")
+    if os.name == "nt" and keep_awake_enabled:
+        if awake:
+            print("Windows: suspensao e desligamento automatico da tela inibidos.")
+            print("Observacao: isso nao falsifica atividade nem garante status ativo no Teams.")
+        else:
+            print("Aviso: o Windows nao permitiu inibir a suspensao.")
+
+    try:
+        while True:
+            cycle_started = time.monotonic()
+            collect_once(output_dir, requested_copilot, timeout_seconds)
+            elapsed = time.monotonic() - cycle_started
+            wait_seconds = max(0, interval_seconds - elapsed)
+            next_run = dt.datetime.now().astimezone() + dt.timedelta(seconds=wait_seconds)
+            print("\nProxima coleta: {}".format(next_run.strftime("%d/%m/%Y %H:%M:%S %z")))
+            time.sleep(wait_seconds)
+    finally:
+        keep_awake.stop()
 
 
 def parse_args():
@@ -714,6 +988,11 @@ def parse_args():
         default=60,
         help="tempo maximo de cada resposta do CLI, em segundos (padrao: 60)",
     )
+    parser.add_argument(
+        "--permitir-suspensao",
+        action="store_true",
+        help="nao impede a suspensao automatica do Windows durante o loop",
+    )
     args = parser.parse_args()
     if args.intervalo_horas <= 0:
         parser.error("--intervalo-horas deve ser maior que zero")
@@ -734,6 +1013,7 @@ def main():
             args.copilot,
             args.timeout,
             args.intervalo_horas,
+            not args.permitir_suspensao,
         )
         return 0
     except KeyboardInterrupt:
