@@ -33,7 +33,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
-VERSAO = "2.2.0"
+VERSAO = "2.3.0"
 MAX_RPC_BYTES = 50 * 1024 * 1024
 MUTEX_NAME = r"Local\CopilotUsoCsvPython"
 
@@ -688,6 +688,46 @@ class RpcClient:
         self.close()
 
 
+def merge_model_metadata(session_models, catalog_models, price_categories=None):
+    """Mantem a lista da sessao e completa seus dados com o catalogo global."""
+
+    def merge_dict(base, specific):
+        base = base if isinstance(base, dict) else {}
+        specific = specific if isinstance(specific, dict) else {}
+        result = dict(base)
+        for key, value in specific.items():
+            if isinstance(value, dict):
+                result[key] = merge_dict(result.get(key), value)
+            elif value not in (None, "", [], {}):
+                result[key] = value
+            elif key not in result:
+                result[key] = value
+        return result
+
+    catalog_by_id = {
+        str(get_value(model, "id")): model
+        for model in (catalog_models if isinstance(catalog_models, list) else [])
+        if isinstance(model, dict) and get_value(model, "id")
+    }
+    price_by_id = {}
+    for item in price_categories if isinstance(price_categories, list) else []:
+        model_id = str(get_value(item, "id"))
+        price_category = get_value(item, "priceCategory")
+        if model_id and price_category != "":
+            price_by_id[model_id] = price_category
+
+    merged = []
+    for session_model in (session_models if isinstance(session_models, list) else []):
+        if not isinstance(session_model, dict):
+            continue
+        model_id = str(get_value(session_model, "id"))
+        model = merge_dict(catalog_by_id.get(model_id, {}), session_model)
+        if not get_value(model, "modelPickerPriceCategory") and model_id in price_by_id:
+            model["modelPickerPriceCategory"] = price_by_id[model_id]
+        merged.append(model)
+    return merged
+
+
 def list_models_for_cli_session(client):
     """
     Consulta a lista associada a uma sessao, equivalente conceitual do seletor
@@ -735,12 +775,35 @@ def list_models_for_cli_session(client):
         if not isinstance(models, list) or not models:
             raise CollectorError("session.model.list nao retornou modelos")
         quotas = get_value(session_result, "quotaSnapshots", None)
-        return models, quotas, "session.model.list", ""
+        price_categories = get_value(session_result, "modelPriceCategories", None)
+
+        catalog_warning = ""
+        catalog_models = []
+        try:
+            global_result = client.call("models.list", {"skipCache": True})
+            catalog_models = get_value(global_result, "models", [])
+        except Exception as exc:
+            catalog_warning = (
+                "nao foi possivel obter os metadados de preco de models.list: {}"
+            ).format(exc)
+
+        models = merge_model_metadata(models, catalog_models, price_categories)
+        source = "session.model.list + models.list"
+        if not catalog_models:
+            source = "session.model.list"
+        return models, quotas, source, catalog_warning
     except Exception as exc:
         session_error = str(exc)
         global_result = client.call("models.list", {"skipCache": True})
         models = get_value(global_result, "models", [])
-        return models, None, "models.list (fallback)", session_error
+        return (
+            models,
+            None,
+            "models.list (fallback)",
+            "lista da sessao indisponivel; usado fallback global: {}".format(
+                session_error
+            ),
+        )
     finally:
         if session_created:
             try:
@@ -889,8 +952,8 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
                 try:
                     # A API nao e paginada. O seletor /models trabalha no
                     # contexto de uma sessao, por isso ele pode diferir do RPC
-                    # global. A funcao usa session.model.list e so recorre ao
-                    # models.list global em runtimes antigos.
+                    # global. A sessao define quais modelos aparecem e o RPC
+                    # global completa billing e precos quando disponiveis.
                     (
                         models,
                         session_quota_snapshots,
@@ -898,11 +961,7 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
                         session_warning,
                     ) = list_models_for_cli_session(client)
                     if session_warning:
-                        warnings.append(
-                            "lista da sessao indisponivel; usado fallback global: {}".format(
-                                session_warning
-                            )
-                        )
+                        warnings.append(session_warning)
                     model_rows = models_to_rows(models, collected_at)
                     if not model_rows:
                         model_rows = None
