@@ -33,7 +33,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
-VERSAO = "2.1.0"
+VERSAO = "2.2.0"
 MAX_RPC_BYTES = 50 * 1024 * 1024
 MUTEX_NAME = r"Local\CopilotUsoCsvPython"
 
@@ -204,6 +204,36 @@ def append_history_csv(path, rows, fields):
         if not exists:
             writer.writeheader()
         writer.writerows(normalize_row(row, fields) for row in rows)
+
+
+def write_dashboard_data(csv_path):
+    """Cria um arquivo JavaScript que o HTML pode ler via file:// sem servidor."""
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return
+
+    csv_text = csv_path.read_text(encoding="utf-8-sig")
+    js_path = csv_path.with_name("copilot_dados.js")
+    temp_path = js_path.with_name(
+        "{}.tmp-{}-{}".format(js_path.name, os.getpid(), uuid.uuid4().hex)
+    )
+    payload = (
+        "// Gerado automaticamente por copilot_uso.py. Nao edite.\n"
+        "window.COPILOT_CSV_TEXT = {};\n"
+        "window.COPILOT_CSV_UPDATED_AT = {};\n".format(
+            json.dumps(csv_text, ensure_ascii=True),
+            json.dumps(agora_iso()),
+        )
+    )
+
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload)
+        os.replace(str(temp_path), str(js_path))
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def rows_by_key(rows, key_field, fields):
@@ -931,12 +961,16 @@ def collect_once(output_dir, requested_copilot, timeout_seconds):
         )
         try:
             try:
-                append_history_csv(
-                    output_dir / "copilot_dados.csv", unified_rows, COPILOT_FIELDS
-                )
+                csv_path = output_dir / "copilot_dados.csv"
+                append_history_csv(csv_path, unified_rows, COPILOT_FIELDS)
             except OSError as exc:
                 errors.append("CSV: {}".format(exc))
                 status = "erro"
+            else:
+                try:
+                    write_dashboard_data(csv_path)
+                except OSError as exc:
+                    print("Aviso: nao foi possivel atualizar copilot_dados.js: {}".format(exc))
             try:
                 append_log(
                     output_dir,
